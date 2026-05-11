@@ -4,6 +4,7 @@ use (
 	./apps/cli
 	./apps/daemon
 	./apps/daytona-e2e
+	./apps/session-daemon
 	./apps/otel-collector/exporter
 	./apps/proxy
 	./apps/runner

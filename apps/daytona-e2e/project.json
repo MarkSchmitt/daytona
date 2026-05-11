@@ -27,6 +27,14 @@
         "cwd": "{projectRoot}",
         "command": "go test -tags e2e -run TestCleanupStaleSandboxes -v -timeout 60s ./..."
       }
+    },
+    "e2e:sessions": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "{projectRoot}",
+        "command": "go test -tags e2e -run TestSession -v -count=1 -timeout 600s ./..."
+      },
+      "cache": false
     }
   }
 }

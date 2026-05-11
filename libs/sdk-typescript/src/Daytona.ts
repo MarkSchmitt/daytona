@@ -23,8 +23,8 @@ import {
   DaytonaValidationError,
 } from './errors/DaytonaError'
 import { Image } from './Image'
-import { Sandbox } from './Sandbox'
-import type { ListSandboxesQuery } from './Sandbox'
+import { SessionService } from './Session'
+import { Sandbox, ListSandboxesQuery } from './Sandbox'
 import { SnapshotService } from './Snapshot'
 import { VolumeService } from './Volume'
 import { getPackageInfo, dynamicRequire } from './utils/Import'
@@ -238,6 +238,7 @@ export class Daytona implements AsyncDisposable {
   private otelSdk?: NodeSDK
   public readonly volume: VolumeService
   public readonly snapshot: SnapshotService
+  public readonly session: SessionService
 
   /**
    * Creates a new Daytona client instance.
@@ -332,6 +333,22 @@ export class Daytona implements AsyncDisposable {
       this.objectStorageApi,
       this.target,
     )
+    // The SessionService is a thin axios client today; once `yarn generate:api-client`
+    // produces an SessionsApi the service will switch to it without an SDK API change.
+    // We give it a child axios instance with the API baseURL + auth headers baked in,
+    // since unlike the generated APIs it doesn't take a Configuration param at every call.
+    const sessionAxios = axios.create({
+      baseURL: this.apiUrl,
+      timeout: 5 * 60 * 1000,
+      headers: {
+        Authorization: `Bearer ${this.apiKey || this.jwtToken}`,
+        'X-Daytona-Source': sdkLabel,
+        'X-Daytona-SDK-Version': packageJson.version,
+        'User-Agent': `${sdkLabel}/${packageJson.version}`,
+        ...orgHeader,
+      },
+    })
+    this.session = new SessionService(sessionAxios)
     this.clientConfig = configuration
 
     const env = envReader()

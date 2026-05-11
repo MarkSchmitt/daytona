@@ -356,6 +356,26 @@ const configuration = {
     force: process.env.DRAINING_FORCE === 'true',
   },
   dontServeDashboard: process.env.DONT_SERVE_DASHBOARD === 'true',
+  session: {
+    defaultTemplate: process.env.DEFAULT_SESSION_TEMPLATE ?? 'python-default',
+    daemonPort: parseInt(process.env.SESSION_DAEMON_PORT || '2281', 10),
+    healthcheckTimeoutMs: parseInt(process.env.SESSION_HEALTHCHECK_TIMEOUT_MS || '60000', 10),
+    provisionTimeoutMs: parseInt(process.env.SESSION_PROVISION_TIMEOUT_MS || '180000', 10),
+    execTimeoutSeconds: parseInt(process.env.SESSION_EXEC_TIMEOUT_SECONDS || '600', 10),
+    idleAutoStopMinutes: parseInt(process.env.SESSION_IDLE_AUTOSTOP_MINUTES || '0', 10),
+    connectTokenTtlSeconds: parseInt(process.env.SESSION_CONNECT_TOKEN_TTL_SECONDS || '300', 10),
+    cache: {
+      contextTtlSeconds: parseInt(process.env.SESSION_CACHE_TTL_SECONDS || '300', 10),
+      instanceTtlSeconds: parseInt(process.env.SESSION_CACHE_INSTANCE_TTL_SECONDS || '60', 10),
+      lastUsedAtThrottleMs: parseInt(process.env.SESSION_CACHE_LASTUSEDAT_THROTTLE_MS || '5000', 10),
+    },
+    context: {
+      idleTtlSeconds: parseInt(process.env.SESSION_IDLE_TTL_SECONDS || '3600', 10),
+      absoluteTtlSeconds: parseInt(process.env.SESSION_ABSOLUTE_TTL_SECONDS || '604800', 10),
+      gcBatchSize: parseInt(process.env.SESSION_GC_BATCH_SIZE || '500', 10),
+      expiredGracePeriodSeconds: parseInt(process.env.SESSION_EXPIRED_GRACE_SECONDS || '86400', 10),
+    },
+  },
 }
 
 export { configuration }
