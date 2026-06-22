@@ -17,8 +17,6 @@ import (
 // TestSessionConnectStreaming verifies that POST /api/sessions/connect returns a signed wsUrl,
 // and that opening the WebSocket streams stdout chunks incrementally (not all at once at end).
 func TestSessionConnectStreaming(t *testing.T) {
-	t.Skipf("not yet implemented: session-service-controller, session-daemon-app")
-
 	cfg := LoadConfig(t)
 	api := NewAPIClient(cfg)
 	ic := NewSessionClient(api)

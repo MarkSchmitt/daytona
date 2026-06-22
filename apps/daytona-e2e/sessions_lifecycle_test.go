@@ -8,6 +8,7 @@ package e2e_test
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -26,7 +27,7 @@ func TestSessionCreateRunDelete(t *testing.T) {
 		"template": "python-default",
 		"language": "python",
 	})
-	require.Equal(t, http.StatusCreated, status, "POST /sessions must return 201")
+	require.Equal(t, http.StatusOK, status, "POST /sessions must return 200")
 
 	id, _ := created["id"].(string)
 	require.NotEmpty(t, id, "context id must be present")
@@ -58,8 +59,6 @@ func TestSessionCreateRunDelete(t *testing.T) {
 // TestSessionListNoLeak verifies that listing contexts shows ACTIVE rows with the right
 // shape and never leaks sandbox identifiers.
 func TestSessionListNoLeak(t *testing.T) {
-	t.Skipf("not yet implemented: session-entity, session-gc")
-
 	cfg := LoadConfig(t)
 	api := NewAPIClient(cfg)
 	ic := NewSessionClient(api)
@@ -68,7 +67,7 @@ func TestSessionListNoLeak(t *testing.T) {
 		"template": "python-default",
 		"language": "python",
 	})
-	require.Equal(t, http.StatusCreated, status)
+	require.Equal(t, http.StatusOK, status)
 	id, _ := created["id"].(string)
 	t.Cleanup(func() { _ = ic.DeleteSession(t, id) })
 
@@ -106,7 +105,7 @@ func TestSessionOmitTemplateOnUse(t *testing.T) {
 		"template": "python-default",
 		"language": "python",
 	})
-	require.Equal(t, http.StatusCreated, status)
+	require.Equal(t, http.StatusOK, status)
 	id, _ := created["id"].(string)
 	t.Cleanup(func() { _ = ic.DeleteSession(t, id) })
 
@@ -118,4 +117,105 @@ func TestSessionOmitTemplateOnUse(t *testing.T) {
 
 	stdout, _ := body["stdout"].(string)
 	assert.Equal(t, "hello\n", stdout)
+}
+
+// TestSessionDeleteIsIdempotent verifies that DELETE /sessions/:id returns 204 on the
+// first call and continues to return 204 on subsequent calls (SessionRepository.delete is
+// documented as idempotent: it short-circuits when the row is already gone).
+func TestSessionDeleteIsIdempotent(t *testing.T) {
+	cfg := LoadConfig(t)
+	api := NewAPIClient(cfg)
+	ic := NewSessionClient(api)
+
+	created, status := ic.CreateSession(t, map[string]interface{}{
+		"template": "python-default",
+		"language": "python",
+	})
+	require.Equal(t, http.StatusOK, status)
+	id, _ := created["id"].(string)
+	require.NotEmpty(t, id)
+
+	assert.Equal(t, http.StatusNoContent, ic.DeleteSession(t, id), "first delete must return 204")
+	assert.Equal(t, http.StatusNoContent, ic.DeleteSession(t, id), "second delete must still return 204 (idempotent)")
+}
+
+// TestSessionGetAccessRefreshes verifies that GET /sessions/:id/access mints a fresh signed
+// proxy bundle on every call (different tokens) and the second call's tokenExpiresAt is not
+// earlier than the first's. Acts as a keep-alive too — bumps lastUsedAt.
+func TestSessionGetAccessRefreshes(t *testing.T) {
+	cfg := LoadConfig(t)
+	api := NewAPIClient(cfg)
+	ic := NewSessionClient(api)
+
+	created, status := ic.CreateSession(t, map[string]interface{}{
+		"template": "python-default",
+		"language": "python",
+	})
+	require.Equal(t, http.StatusOK, status)
+	id, _ := created["id"].(string)
+	require.NotEmpty(t, id)
+	t.Cleanup(func() { _ = ic.DeleteSession(t, id) })
+
+	first, firstStatus := ic.GetSessionAccess(t, id)
+	require.Equal(t, http.StatusOK, firstStatus)
+	firstURL, _ := first["wsUrl"].(string)
+	firstToken, _ := first["token"].(string)
+	firstExp, _ := first["tokenExpiresAt"].(string)
+	require.NotEmpty(t, firstURL, "access must expose wsUrl")
+	require.NotEmpty(t, firstToken, "access must expose token")
+	require.NotEmpty(t, firstExp, "access must expose tokenExpiresAt")
+
+	// Small sleep so the second mint lands at a strictly later wall-clock second.
+	// SessionService.buildSandboxAccess derives tokenExpiresAt = now + ttl, so a 1s
+	// gap is enough to differentiate without making the test slow.
+	time.Sleep(1100 * time.Millisecond)
+
+	second, secondStatus := ic.GetSessionAccess(t, id)
+	require.Equal(t, http.StatusOK, secondStatus)
+	secondURL, _ := second["wsUrl"].(string)
+	secondExp, _ := second["tokenExpiresAt"].(string)
+	require.NotEmpty(t, secondURL)
+	require.NotEmpty(t, secondExp)
+
+	firstT, err := time.Parse(time.RFC3339Nano, firstExp)
+	require.NoError(t, err, "first tokenExpiresAt must be RFC3339")
+	secondT, err := time.Parse(time.RFC3339Nano, secondExp)
+	require.NoError(t, err, "second tokenExpiresAt must be RFC3339")
+	assert.False(t, secondT.Before(firstT), "second tokenExpiresAt must not be earlier than the first")
+}
+
+// TestSessionCreateTransientIdempotent verifies that POST /sessions/transients returns
+// the same deterministic id for the same (template, language) pair while the warm pool
+// instance is unchanged. The id is `transient-${instance.id}-${language}` — see
+// SessionService.createTransientSession.
+func TestSessionCreateTransientIdempotent(t *testing.T) {
+	cfg := LoadConfig(t)
+	api := NewAPIClient(cfg)
+	ic := NewSessionClient(api)
+
+	first, firstStatus := ic.CreateTransient(t, map[string]interface{}{
+		"template": "python-default",
+		"language": "python",
+	})
+	require.Equal(t, http.StatusOK, firstStatus)
+	firstID, _ := first["id"].(string)
+	require.NotEmpty(t, firstID, "transient must return an id")
+	require.Contains(t, firstID, "transient-", "transient id is `transient-<instance>-<lang>`")
+	assertNoSandboxLeak(t, first, "")
+
+	second, secondStatus := ic.CreateTransient(t, map[string]interface{}{
+		"template": "python-default",
+		"language": "python",
+	})
+	require.Equal(t, http.StatusOK, secondStatus)
+	secondID, _ := second["id"].(string)
+	assert.Equal(t, firstID, secondID, "transient must be deterministic per (template, language)")
+
+	// Both calls must return a usable access bundle.
+	for label, body := range map[string]map[string]interface{}{"first": first, "second": second} {
+		access, ok := body["access"].(map[string]interface{})
+		require.True(t, ok, "%s transient must include access bundle", label)
+		assert.NotEmpty(t, access["wsUrl"], "%s access.wsUrl must be set", label)
+		assert.NotEmpty(t, access["token"], "%s access.token must be set", label)
+	}
 }

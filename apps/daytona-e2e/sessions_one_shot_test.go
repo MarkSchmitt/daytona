@@ -16,8 +16,6 @@ import (
 // TestSessionCodeRunPython runs `print(7*8)` and validates stdout, no error, positive duration,
 // no sandbox identifiers in the response body.
 func TestSessionCodeRunPython(t *testing.T) {
-	t.Skipf("not yet implemented: session-service-controller, session-daemon-app")
-
 	cfg := LoadConfig(t)
 	api := NewAPIClient(cfg)
 	ic := NewSessionClient(api)

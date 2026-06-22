@@ -6,6 +6,7 @@
 package e2e_test
 
 import (
+	"encoding/json"
 	"net/http"
 	"os"
 	"testing"
@@ -14,23 +15,28 @@ import (
 )
 
 // TestSessionResponsesHideSandboxIdentifiers walks every JSON field in every session API response
-// (templates, contexts, code-run, connect) and asserts:
+// (templates, contexts, code-run, connect, transients, access) and asserts:
 //  1. NO field name matches the forbidden sandbox-leak pattern (defensive — none are in v1 DTOs).
 //  2. The actual SessionInstance.sandboxId UUID for the test org+template never appears as a
 //     value anywhere in any response body (catches a leak under a renamed field).
 //
-// Step (2) requires the e2e DB connection; if not configured, runs only the field-name check.
+// Step (2) requires being able to look up the warm sandbox by label; if the lookup returns "",
+// only the field-name check runs.
 func TestSessionResponsesHideSandboxIdentifiers(t *testing.T) {
-	t.Skipf("not yet implemented: session-service-controller")
-
 	cfg := LoadConfig(t)
 	api := NewAPIClient(cfg)
 	ic := NewSessionClient(api)
 
-	// Trigger sandbox provisioning so a sandboxId exists to look up.
-	_, _ = ic.CodeRun(t, map[string]interface{}{"language": "python", "code": "1"})
+	// Trigger pool provisioning so a sandboxId exists to look up. We create a context
+	// rather than running code so this test is independent of the daemon execution path.
+	seed, seedStatus := ic.CreateSession(t, map[string]interface{}{
+		"template": "python-default", "language": "python",
+	})
+	require.Equal(t, http.StatusOK, seedStatus, "seed createSession must succeed for leak walk")
+	seedID, _ := seed["id"].(string)
+	t.Cleanup(func() { _ = ic.DeleteSession(t, seedID) })
 
-	knownSandboxID := lookupSandboxIDForTemplate(t, "python-default")
+	knownSandboxID := lookupSandboxIDForTemplate(t, api, "python-default")
 
 	// 1. /templates
 	templates, _ := ic.ListTemplates(t)
@@ -38,50 +44,74 @@ func TestSessionResponsesHideSandboxIdentifiers(t *testing.T) {
 		assertNoSandboxLeak(t, raw, knownSandboxID)
 	}
 
-	// 2. /code-run (one-shot)
-	body, _ := ic.CodeRun(t, map[string]interface{}{"language": "python", "code": "print(1)"})
-	assertNoSandboxLeak(t, body, knownSandboxID)
-
-	// 3. /connect
-	conn, _ := ic.Connect(t, map[string]interface{}{
-		"template": "python-default", "language": "python",
-	})
-	if id, _ := conn["sessionId"].(string); id != "" {
-		t.Cleanup(func() { _ = ic.DeleteSession(t, id) })
-	}
-	assertNoSandboxLeak(t, conn, knownSandboxID)
-
-	// 4. /sessions (POST)
-	created, status := ic.CreateSession(t, map[string]interface{}{
-		"template": "python-default", "language": "python",
-	})
-	if status == http.StatusCreated {
-		id, _ := created["id"].(string)
-		t.Cleanup(func() { _ = ic.DeleteSession(t, id) })
-		assertNoSandboxLeak(t, created, knownSandboxID)
+	// 2. /templates/:name/packages
+	pkgs, _ := ic.ListPackages(t, "python-default", "python")
+	for _, p := range pkgs {
+		assertNoSandboxLeak(t, p, knownSandboxID)
 	}
 
-	// 5. /sessions (GET)
+	// 3. /sessions (POST) — the seed we created above
+	assertNoSandboxLeak(t, seed, knownSandboxID)
+
+	// 4. /sessions (GET)
 	contexts, _ := ic.ListSessions(t, "")
 	for _, ctx := range contexts {
 		assertNoSandboxLeak(t, ctx, knownSandboxID)
 	}
 
-	// 6. /templates/:name/packages
-	pkgs, _ := ic.ListPackages(t, "python-default", "python")
-	for _, p := range pkgs {
-		assertNoSandboxLeak(t, p, knownSandboxID)
+	// 5. /sessions/:id/access (refresh)
+	access, accessStatus := ic.GetSessionAccess(t, seedID)
+	require.Equal(t, http.StatusOK, accessStatus)
+	assertNoSandboxLeak(t, access, knownSandboxID)
+
+	// 6. /sessions/transients
+	transient, transientStatus := ic.CreateTransient(t, map[string]interface{}{
+		"template": "python-default", "language": "python",
+	})
+	require.Equal(t, http.StatusOK, transientStatus)
+	assertNoSandboxLeak(t, transient, knownSandboxID)
+
+	// 7. /sessions/connect
+	conn, connStatus := ic.Connect(t, map[string]interface{}{
+		"template": "python-default", "language": "python",
+	})
+	require.Equal(t, http.StatusOK, connStatus)
+	if id, _ := conn["sessionId"].(string); id != "" {
+		t.Cleanup(func() { _ = ic.DeleteSession(t, id) })
 	}
+	assertNoSandboxLeak(t, conn, knownSandboxID)
 }
 
-// lookupSandboxIDForTemplate stub mirrors lookupSandboxIDForContext. Until the test is
-// unskipped, it returns "" so that step (2) of the leak check is effectively a no-op.
-func lookupSandboxIDForTemplate(t *testing.T, _ string) string {
+// lookupSandboxIDForTemplate finds the warm-pool sandbox that backs the given template
+// for the current organization by querying /sandbox/paginated for sandboxes labeled
+// `daytona.io/session-template=<name>`. Returns the first matching sandbox id, or "" if
+// none found (in which case the leak walk falls back to field-name-only checks).
+//
+// This is the API-only equivalent of "read SessionInstance.sandboxId from the DB"; we
+// rely on the documented label set the pool writes when it creates the warm sandbox
+// (see SessionPoolService.acquire labels: daytona.io/session, daytona.io/session-template,
+// daytona.io/session-instance).
+func lookupSandboxIDForTemplate(t *testing.T, api *APIClient, templateName string) string {
 	t.Helper()
-	if os.Getenv("DAYTONA_E2E_DB_URL") == "" {
+	path := `/sandbox/paginated?labels={"daytona.io/session-template":"` + templateName + `"}`
+	resp, raw := api.DoRequest(t, http.MethodGet, path, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Logf("lookupSandboxIDForTemplate(%q): list returned %d (skipping value-leak check)", templateName, resp.StatusCode)
 		return ""
 	}
-	require.Fail(t, "lookupSandboxIDForTemplate not implemented yet; set DAYTONA_E2E_DB_URL only after wiring this helper")
+	var page struct {
+		Items []map[string]interface{} `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &page); err != nil {
+		t.Logf("lookupSandboxIDForTemplate(%q): cannot parse paginated body: %v (skipping value-leak check)", templateName, err)
+		return ""
+	}
+	for _, item := range page.Items {
+		if id, ok := item["id"].(string); ok && id != "" {
+			return id
+		}
+	}
+	t.Logf("lookupSandboxIDForTemplate(%q): no sandboxes labeled with this template (skipping value-leak check)", templateName)
 	return ""
 }
 

@@ -16,8 +16,6 @@ import (
 // TestSessionListTemplates verifies the templates endpoint returns python-default with
 // the documented language and package metadata, and never leaks sandbox identifiers.
 func TestSessionListTemplates(t *testing.T) {
-	t.Skipf("not yet implemented: session-template-entity, session-service-controller")
-
 	cfg := LoadConfig(t)
 	api := NewAPIClient(cfg)
 	ic := NewSessionClient(api)
@@ -48,9 +46,9 @@ func TestSessionListTemplates(t *testing.T) {
 }
 
 // TestSessionListPackagesPython verifies the python package list includes the curated venv.
+// The API forwards GET /packages to the in-sandbox daemon, so this exercises the full
+// pool-acquire + runner-proxy + daemon path (without code execution).
 func TestSessionListPackagesPython(t *testing.T) {
-	t.Skipf("not yet implemented: session-service-controller")
-
 	cfg := LoadConfig(t)
 	api := NewAPIClient(cfg)
 	ic := NewSessionClient(api)

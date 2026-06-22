@@ -4,7 +4,7 @@
   "projectType": "application",
   "sourceRoot": "apps/daytona-e2e",
   "tags": [],
-  "implicitDependencies": ["api", "runner", "proxy", "dashboard"],
+  "implicitDependencies": ["api", "runner", "proxy", "dashboard", "session-daemon"],
   "targets": {
     "e2e": {
       "executor": "nx:run-commands",

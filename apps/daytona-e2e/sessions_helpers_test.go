@@ -87,6 +87,30 @@ func (ic *SessionClient) DeleteSession(t *testing.T, id string) int {
 	return resp.StatusCode
 }
 
+// CreateTransient calls POST /api/sessions/transients.
+// Returns the parsed SessionDto (including the embedded `access` bundle) and HTTP status.
+func (ic *SessionClient) CreateTransient(t *testing.T, body map[string]interface{}) (map[string]interface{}, int) {
+	t.Helper()
+	resp, raw := ic.api.DoRequest(t, http.MethodPost, "/sessions/transients", body)
+	var parsed map[string]interface{}
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &parsed)
+	}
+	return parsed, resp.StatusCode
+}
+
+// GetSessionAccess calls GET /api/sessions/:id/access. Refreshes the SDK's
+// direct-to-sandbox access bundle and acts as a keep-alive (bumps lastUsedAt).
+func (ic *SessionClient) GetSessionAccess(t *testing.T, id string) (map[string]interface{}, int) {
+	t.Helper()
+	resp, raw := ic.api.DoRequest(t, http.MethodGet, "/sessions/"+id+"/access", nil)
+	var parsed map[string]interface{}
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &parsed)
+	}
+	return parsed, resp.StatusCode
+}
+
 // ListTemplates calls GET /api/sessions/templates.
 func (ic *SessionClient) ListTemplates(t *testing.T) ([]interface{}, int) {
 	t.Helper()

@@ -20,8 +20,6 @@ import (
 // TestSessionRejectsMissingApiKey verifies that POST /api/sessions/code-run without an
 // Authorization header returns 401.
 func TestSessionRejectsMissingApiKey(t *testing.T) {
-	t.Skipf("not yet implemented: session-module-wiring")
-
 	cfg := LoadConfig(t)
 	url := strings.TrimRight(cfg.BaseURL, "/") + "/sessions/code-run"
 
@@ -61,7 +59,7 @@ func TestSessionRejectsCrossOrgContext(t *testing.T) {
 	created, status := icA.CreateSession(t, map[string]interface{}{
 		"template": "python-default", "language": "python",
 	})
-	require.Equal(t, http.StatusCreated, status)
+	require.Equal(t, http.StatusOK, status)
 	id, _ := created["id"].(string)
 	t.Cleanup(func() { _ = icA.DeleteSession(t, id) })
 
