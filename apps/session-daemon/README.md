@@ -503,7 +503,8 @@ apps/session-daemon/
 │   ├── python_subprocess.go               ← CPython worker (knob #2 pre-warmed pool)
 │   ├── ts_host.go                         ← V8/isolated-vm host: compileModule + ESM resolver
 │   └── types.go                           ← Wire types: CreateSessionRequest, OutputMessage
-└── Dockerfile                             ← Multi-stage build of the session-runtime image
+├── Dockerfile                             ← Multi-stage build of the session-runtime image (monorepo-aware, builds the daemon inline)
+└── snapshot.Dockerfile                    ← Self-contained variant for the Daytona snapshot API path — see "Installing the snapshot via the Daytona API" below
 
 libs/sdk-python/src/daytona/_sync/session.py     ← Sync SDK: caches access, WS-direct, retry/recovery
 libs/sdk-python/src/daytona/_async/session.py    ← Async version (aiohttp + websockets)
@@ -521,6 +522,101 @@ Seeded by migration `1778367241001-migration.ts` — registers a
 `daytonaio/session-runtime:python-default-<version>`. Org-specific templates
 (custom snapshot + curated packages) are coming; the resolver already
 prefers org-scoped over general so the plumbing is in place.
+
+### Installing the snapshot via the Daytona API
+
+The seed migration registers the template row but ships an `imageName`
+placeholder (`daytonaio/session-runtime:python-default-placeholder`) because
+the actual runtime image has to be built and pushed into your Daytona's
+internal registry. There are two supported ways to do that.
+
+**Option A — via the Daytona snapshot API (no local Docker required).** This
+is the path most operators want: you build the daemon binary somewhere with
+internet access, host the binary at an HTTPS URL the build-runner can reach
+(GitHub Release asset, presigned S3 URL, internal artifact store), and the
+Daytona snapshot API builds the runtime image on-cluster from a single
+self-contained Dockerfile.
+
+```bash
+nix develop .#go --command bash -c "VERSION=v0.0.0-dev nx run session-daemon:build-amd64 --configuration=production"
+
+# 2. Host dist/apps/session-daemon-amd64 somewhere the runner can curl.
+#    Examples (pick whichever fits your deploy):
+#      gh release upload v0.0.0-dev dist/apps/session-daemon-amd64
+#      aws s3 presign --expires-in 3600 s3://my-bucket/session-daemon-amd64
+#    Capture the URL (and ideally a sha256).
+export SESSION_DAEMON_URL=https://github.com/daytonaio/daytona/releases/download/v0.0.0-dev/session-daemon-amd64
+export SESSION_DAEMON_SHA256=$(sha256sum dist/apps/session-daemon-amd64 | awk '{print $1}')
+
+# 3. Create the snapshot via the Daytona API. This calls
+#    `daytona snapshot create python-default --dockerfile ... --cpu 2 --memory 2 --disk 5`
+#    under the hood, which POSTs the rendered Dockerfile to /api/snapshots and
+#    streams the build logs until the snapshot reaches state=ACTIVE.
+nix develop --command bash -c "nx run session-daemon:create-snapshot"
+```
+
+What this does end-to-end:
+
+1. `render-snapshot-dockerfile` runs `envsubst` against
+   [`apps/session-daemon/snapshot.Dockerfile`](snapshot.Dockerfile),
+   substituting `${SESSION_DAEMON_URL}` and `${SESSION_DAEMON_SHA256}` into
+   `dist/apps/session-daemon-snapshot/snapshot.rendered.Dockerfile`. This
+   pre-rendering is necessary because the snapshot API's
+   `buildInfo.dockerfileContent` field is a plain string — there's no
+   equivalent of `docker --build-arg`.
+2. `create-snapshot` shells out to the Daytona CLI, which uploads the
+   rendered Dockerfile to `POST /api/snapshots`. There is no build context
+   to upload (the Dockerfile has no `COPY` statements that reference local
+   files) so `contextHashes` is empty.
+3. The API picks a runner via the existing builder scheduling and emits a
+   `BUILD_SNAPSHOT` job. The runner builds the image inside its sandbox
+   builder, pushes the result to the internal registry, and updates the
+   snapshot row's `imageName` to that registry-qualified tag plus
+   `state=ACTIVE`.
+4. The CLI streams the build logs and waits for `state=ACTIVE`.
+
+Overridable env vars consumed by `create-snapshot`:
+
+| Var | Default | Purpose |
+|---|---|---|
+| `SESSION_DAEMON_URL` | _(required)_ | HTTPS URL the build runner curls to fetch the prebuilt daemon binary |
+| `SESSION_DAEMON_SHA256` | _(empty)_ | Optional sha256 digest; when set, the build aborts on mismatch |
+| `SNAPSHOT_NAME` | `python-default` | Snapshot row name. Override to publish a versioned tag like `python-default-v0.3.1` |
+| `SNAPSHOT_CPU` / `SNAPSHOT_MEMORY` / `SNAPSHOT_DISK` | `2` / `2` / `5` | Resource sizing baked into the snapshot row, used by the pool when spawning sandboxes |
+
+The snapshot the API creates is per-org by default. To make it the new
+`general=true` `python-default` snapshot that the seed migration's template
+points at, an operator currently has to `UPDATE` the seeded row's
+`imageName` to match the new snapshot's `imageName`. A dedicated
+"promote-to-general" admin endpoint is on the operational backlog;
+once it lands this README will switch to recommending it.
+
+**Option B — via `docker build` (CI and local validation).** When you're
+already in a build environment with the monorepo on disk and a working
+Docker daemon, the multi-stage [`apps/session-daemon/Dockerfile`](Dockerfile)
+is the path of least resistance: stage 1 builds the daemon from source,
+stage 2 bakes it into the runtime image, and you push the result to whatever
+registry your Daytona installation is configured to pull from.
+
+```bash
+docker build -f apps/session-daemon/Dockerfile \
+  --build-arg VERSION=v0.0.0-dev \
+  -t <your-registry>/daytonaio/session-runtime:python-default-v0.0.0-dev .
+docker push <your-registry>/daytonaio/session-runtime:python-default-v0.0.0-dev
+```
+
+Then point the seeded snapshot row at the tag:
+
+```sql
+UPDATE snapshot
+   SET "imageName" = '<your-registry>/daytonaio/session-runtime:python-default-v0.0.0-dev'
+ WHERE name = 'python-default' AND general = true;
+```
+
+CI uses Option B (see [`.github/workflows/e2e_pr_tests.yaml`](../../.github/workflows/e2e_pr_tests.yaml)
+— it builds the monorepo-aware Dockerfile, pushes to a local registry, and
+patches the seed row). The CI also runs a render-only check on
+`snapshot.Dockerfile` to make sure the Option-A path stays valid.
 
 ### Instance lifecycle
 
