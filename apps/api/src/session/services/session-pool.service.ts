@@ -108,10 +108,6 @@ export class SessionPoolService {
     throw new NotFoundException('Timed out acquiring a session instance (fleet busy or at capacity).')
   }
 
-  async findInstance(orgId: string, templateId: string): Promise<SessionInstance | null> {
-    return this.instanceRepo.findOne({ where: { organizationId: orgId, templateId } })
-  }
-
   /**
    * READY instances for (org, template), with dead/drifted ones rolled out before returning.
    */
