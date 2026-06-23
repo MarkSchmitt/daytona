@@ -42,7 +42,7 @@ func (c *Session) Enqueue(code string, envs map[string]string, timeout time.Dura
 	select {
 	case c.queue <- job:
 	case <-c.queueCtx.Done():
-		doneCh <- execResult{err: fmt.Errorf("context shutting down")}
+		doneCh <- execResult{Err: fmt.Errorf("context shutting down")}
 	}
 	return doneCh
 }
@@ -58,7 +58,7 @@ func (c *Session) processQueue() {
 			}
 			result, err := c.runJob(job)
 			if job.doneCh != nil {
-				job.doneCh <- execResult{cmd: result, err: err}
+				job.doneCh <- execResult{cmd: result, Err: err}
 			}
 		}
 	}
@@ -286,10 +286,9 @@ func drainAndClose(q chan execJob) {
 				return
 			}
 			if job.doneCh != nil {
-				job.doneCh <- execResult{err: fmt.Errorf("context shutdown")}
+				job.doneCh <- execResult{Err: fmt.Errorf("context shutdown")}
 			}
 		default:
-			close(q)
 			return
 		}
 	}
@@ -308,7 +307,6 @@ func (c *Session) AttachWebSocket(ws *websocket.Conn, logger logTarget) *WSClien
 		conn:   ws,
 		send:   make(chan wsFrame, 1024),
 		done:   make(chan struct{}),
-		ctx:    c,
 		logger: logger,
 	}
 

@@ -10,28 +10,36 @@ import { TypedConfigService } from '../../config/typed-config.service'
 class FakeRedis {
   private store = new Map<string, string>()
   private sets = new Map<string, Set<string>>()
+  private expiries = new Map<string, number>()
 
   async incr(key: string): Promise<number> {
+    this.cleanExpired(key)
     const n = (parseInt(this.store.get(key) ?? '0', 10) || 0) + 1
     this.store.set(key, String(n))
     return n
   }
   async decr(key: string): Promise<number> {
+    this.cleanExpired(key)
     const n = (parseInt(this.store.get(key) ?? '0', 10) || 0) - 1
     this.store.set(key, String(n))
     return n
   }
-  async expire(): Promise<number> {
+  async expire(key: string, seconds: number): Promise<number> {
+    if (!this.store.has(key)) return 0
+    this.expiries.set(key, Date.now() + seconds * 1000)
     return 1
   }
   async get(key: string): Promise<string | null> {
+    this.cleanExpired(key)
     return this.store.get(key) ?? null
   }
   async set(key: string, val: string): Promise<'OK'> {
     this.store.set(key, val)
+    this.expiries.delete(key)
     return 'OK'
   }
   async sadd(key: string, member: string): Promise<number> {
+    this.cleanExpired(key)
     const s = this.sets.get(key) ?? new Set<string>()
     const had = s.has(member)
     s.add(member)
@@ -39,9 +47,19 @@ class FakeRedis {
     return had ? 0 : 1
   }
   async srem(key: string, member: string): Promise<number> {
+    this.cleanExpired(key)
     const s = this.sets.get(key)
     if (!s) return 0
     return s.delete(member) ? 1 : 0
+  }
+
+  private cleanExpired(key: string): void {
+    const exp = this.expiries.get(key)
+    if (exp !== undefined && Date.now() >= exp) {
+      this.store.delete(key)
+      this.sets.delete(key)
+      this.expiries.delete(key)
+    }
   }
 }
 
@@ -73,7 +91,7 @@ function newService(config = makeConfig()): { svc: SessionLoadService; redis: Fa
 describe('SessionLoadService', () => {
   describe('in-flight counters', () => {
     it('increments and decrements, never going negative', async () => {
-      const { svc } = newService()
+      const { svc, redis } = newService()
       expect(await svc.incrInflight('i1')).toBe(1)
       expect(await svc.incrInflight('i1')).toBe(2)
       expect(await svc.getInflight('i1')).toBe(2)
@@ -82,6 +100,9 @@ describe('SessionLoadService', () => {
       await svc.decrInflight('i1')
       await svc.decrInflight('i1') // would go to -1
       expect(await svc.getInflight('i1')).toBe(0)
+      const stored = await redis.get('session:load:inflight:i1')
+      expect(stored).toBe('0')
+      expect(await svc.incrInflight('i1')).toBe(1)
     })
   })
 

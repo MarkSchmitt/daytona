@@ -184,7 +184,7 @@ type execJob struct {
 
 type execResult struct {
 	cmd *CommandExecution
-	err error
+	Err error
 }
 
 // Session is one logical execution context. It is a thin façade around a worker

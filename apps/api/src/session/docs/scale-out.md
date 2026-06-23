@@ -52,9 +52,9 @@ Component responsibilities:
 | `SessionPoolService` | `services/session-pool.service.ts` | Owns the fleet lifecycle: `acquire` (claim → scale up → wait/overload), reconcile (`ensureMinWarm`, `scaleIn`, roll dead, prune ERROR). |
 | session-daemon `GET /load` | `apps/session-daemon/internal/server/server.go` + `internal/loadstat` | Reports busy/active context counts, caps, and cgroup-aware CPU/mem/disk + PSI pressure. |
 
-The **source of truth for concurrency** is the daemon's reported busy-context count (it covers both
-API-driven one-shot execs and SDK-direct streaming `connect`). A Redis in-flight counter is an
-optimistic delta that bridges the poll interval to prevent a thundering-herd onto one sandbox.
+The **source of truth for concurrency** is the daemon's reported busy-context count (it tracks
+contexts with in-flight executions). A Redis in-flight counter is an optimistic delta that bridges
+the poll interval to prevent a thundering-herd onto one sandbox.
 
 ## 3. Request routing and stickiness
 

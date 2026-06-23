@@ -21,7 +21,6 @@ type wsClient struct {
 	send      chan wsFrame
 	done      chan struct{}
 	closeOnce sync.Once
-	ctx       *Session
 	logger    logTarget
 }
 

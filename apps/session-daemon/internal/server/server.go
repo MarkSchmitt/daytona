@@ -250,8 +250,12 @@ func (s *Server) handleExecute(c *gin.Context) {
 
 	doneCh := ctx.Enqueue(req.Code, req.Envs, timeout, req.Reset)
 	go func() {
-		<-doneCh
-		cl.RequestClose(websocket.CloseNormalClosure, "completed")
+		result := <-doneCh
+		if result.Err != nil {
+			cl.RequestClose(websocket.CloseInternalServerErr, result.Err.Error())
+		} else {
+			cl.RequestClose(websocket.CloseNormalClosure, "completed")
+		}
 	}()
 
 	cl.AwaitDone()

@@ -293,7 +293,7 @@ func (m *Manager) sweepIdle() {
 
 	m.mu.RLock()
 	for id, c := range m.contexts {
-		if c.snapshotInfo().LastUsedAt.Before(threshold) {
+		if c.snapshotInfo().LastUsedAt.Before(threshold) && !c.IsBusy() {
 			stale = append(stale, id)
 		}
 	}
