@@ -241,6 +241,8 @@ func (s *Server) handleExecute(c *gin.Context) {
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 
+	cl.StartReader()
+
 	timeout := time.Duration(0)
 	if req.Timeout != nil && *req.Timeout > 0 {
 		timeout = time.Duration(*req.Timeout) * time.Second

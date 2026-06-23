@@ -52,6 +52,10 @@ func (cl *wsClient) reader() {
 	}
 }
 
+func (cl *wsClient) StartReader() {
+	go cl.reader()
+}
+
 func (cl *wsClient) writeFrame(frame wsFrame) error {
 	if err := cl.conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
 		return err

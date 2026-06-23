@@ -324,7 +324,6 @@ func (c *Session) AttachWebSocket(ws *websocket.Conn, logger logTarget) *WSClien
 	}
 
 	go cl.writer()
-	go cl.reader() // drain incoming so PingHandler runs
 	return cl
 }
 
