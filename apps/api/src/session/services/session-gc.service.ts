@@ -138,6 +138,6 @@ export class SessionGcService {
     const raw = process.env[name]
     if (!raw) return fallback
     const n = parseInt(raw, 10)
-    return Number.isFinite(n) ? n : fallback
+    return Number.isFinite(n) && n >= 0 ? n : fallback
   }
 }
