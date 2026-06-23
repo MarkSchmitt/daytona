@@ -341,9 +341,11 @@ func (h *tsHost) readLoop() {
 	// Bounded reader rather than bufio.Scanner: a Scanner returns ErrTooLong on a
 	// line past its cap and ENDS the loop, which — via waitLoop's host-exit
 	// propagation — would take down EVERY context sharing this host ([C3]). With
-	// readBoundedLine an over-long line is drained and reported to the AFFECTED
-	// session only, leaving the shared host and all other contexts intact. The
-	// emit-side cap (MAX_CHUNK_BYTES) makes this unreachable in practice.
+	// readBoundedLine an over-long line is drained and SKIPPED (no listener is
+	// notified, see reportOversizedLine), leaving the shared host and all other
+	// contexts intact. The emit-side frame guard (per-field MAX_CHUNK_BYTES plus a
+	// whole-line MAX_LINE_BYTES cap in repl_host.js) makes this unreachable in
+	// practice, so the affected exec is protected without fanning a failure out.
 	reader := bufio.NewReaderSize(h.stdout, 64*1024)
 	for {
 		line, err := readBoundedLine(reader)
@@ -417,28 +419,18 @@ func (h *tsHost) dispatchChunk(chunk *WorkerChunk) {
 	}
 }
 
-// reportOversizedLine surfaces an over-long output frame as an error+completed
-// pair to every registered listener. We cannot know which context emitted the
-// dropped bytes (the sessionId lived inside the unparseable frame), so — to keep
-// the shared host alive ([C3]) without hanging any waiter — we notify all
-// currently-registered contexts. With the emit-side cap in place this is
-// unreachable in practice. Snapshot listeners under the lock, dispatch outside.
+// reportOversizedLine handles an over-long output frame on the SHARED host by
+// draining and skipping it with a logged warning, WITHOUT notifying any listener.
+// The sessionId lived inside the unparseable (already-drained) frame, so we
+// cannot know which context emitted it — fanning a hard failure out to every
+// registered context would take down unrelated in-flight execs on this shared
+// host ([C3] cross-session DoS). Dropping the line silently keeps the host and
+// all other contexts alive. The affected (unknown) exec is protected on the EMIT
+// side instead: repl_host.js bounds every serialized frame below the reader cap
+// (per-field MAX_CHUNK_BYTES plus a whole-line MAX_LINE_BYTES guard), so this
+// path is effectively unreachable for well-behaved output and no exec hangs.
 func (h *tsHost) reportOversizedLine() {
-	h.logger.Warn("dropping oversized ts host chunk", slog.Int("limit", maxWorkerLineBytes))
-	h.mu.Lock()
-	listeners := make(map[string]func(*WorkerChunk), len(h.listeners))
-	for id, fn := range h.listeners {
-		listeners[id] = fn
-	}
-	h.mu.Unlock()
-	msg := fmt.Sprintf("ts host output frame exceeded %d bytes and was dropped", maxWorkerLineBytes)
-	for id, fn := range listeners {
-		if fn == nil {
-			continue
-		}
-		fn(&WorkerChunk{SessionID: id, Type: ChunkTypeError, Name: "WorkerProcessError", Value: msg})
-		fn(&WorkerChunk{SessionID: id, Type: ChunkTypeControl, Text: ControlChunkTypeCompleted})
-	}
+	h.logger.Warn("dropping oversized ts host chunk (no listener notified)", slog.Int("limit", maxWorkerLineBytes))
 }
 
 func (h *tsHost) waitLoop() {

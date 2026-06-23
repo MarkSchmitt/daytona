@@ -54,24 +54,23 @@ export interface SessionExecutionError {
 export interface SessionRunResult {
   stdout: string
   stderr: string
+  /** The execution error, or `null` when the code ran successfully. */
   error: SessionExecutionError | null
   displays: SessionDisplay[]
   durationMs: number
 }
 
 /**
- * Signed direct-to-sandbox access bundle returned by the API.
+ * Signed access bundle for a session, returned by the API.
  *
- * The SDK opens a WebSocket directly to `wsUrl` on the in-sandbox session-daemon
- * via the proxy chain — the URL is self-authenticating (the signed token lives
- * in the proxy subdomain). `token` is exposed for revocation / observability;
- * the SDK does NOT send it as an `Authorization` header.
+ * `token` is exposed for revocation / observability; the SDK does not send it
+ * as an `Authorization` header.
  */
 export interface SessionAccess {
   httpUrl: string
   wsUrl: string
   token: string
-  /** ISO timestamp; the SDK refreshes shortly before this. */
+  /** ISO timestamp; the access is refreshed shortly before this. */
   tokenExpiresAt: string
 }
 
@@ -86,10 +85,41 @@ export interface SessionRef {
   access?: SessionAccess
 }
 
+/**
+ * Reference to an existing session to run code against, optionally carrying a
+ * primed access bundle to skip an extra access lookup.
+ */
+export interface SessionContext {
+  id: string
+  access?: SessionAccess
+}
+
+/** Options for {@link SessionService.createSession}. */
+export interface CreateSessionOptions {
+  template?: string
+  language?: string
+  cwd?: string
+}
+
+/** A runtime template available for sessions. */
+export interface SessionTemplate {
+  name: string
+  description?: string
+  languages: string[]
+  packages?: string[]
+}
+
+/** A package available within a session template. */
+export interface SessionPackage {
+  name: string
+  version: string
+  hasNativeBindings?: boolean
+}
+
 export interface SessionRunOptions {
   language?: 'python' | 'typescript' | 'javascript'
   template?: string
-  context?: { id: string; access?: SessionAccess }
+  context?: SessionContext
   env?: Record<string, string>
   timeout?: number
 }
@@ -163,13 +193,11 @@ class WsAuthError extends Error {}
 /**
  * SessionService is the user-facing SDK surface for the sessions product.
  *
- * The hot path (`run` / `runStream`) skips the Daytona API and talks directly
- * to the in-sandbox session-daemon via the proxy chain — same shape
- * `sandbox.process.code_run` uses against the classic daytona-daemon. The API
- * is only hit on `createSession` / first one-shot / token refresh (every ~5
- * min) / on invalidation. Legacy `POST /sessions/code-run` and
- * `POST /sessions/connect` remain as transparent fallbacks for older API
- * servers.
+ * Use `createSession` to start a persistent session and `run` / `runStream`
+ * to execute code against it. Calls to `run` / `runStream` can also be made
+ * without an explicit session — passing only a `template` / `language` — to
+ * execute one-shot code transparently. `listTemplates` and `listPackages`
+ * describe the runtimes available for sessions.
  */
 export class SessionService {
   // SDK-side caches keyed by context id and `${template}:${language}` for
@@ -191,7 +219,7 @@ export class SessionService {
     return this.runInternal(code, runOpts, { onStdout, onStderr, onError, onDisplay, onControl, signal })
   }
 
-  async createSession(options: { template?: string; language?: string; cwd?: string }): Promise<SessionRef> {
+  async createSession(options: CreateSessionOptions): Promise<SessionRef> {
     try {
       const { data } = await this.http.post<SessionRef>('/sessions', options)
       if (data.access) {
@@ -223,9 +251,7 @@ export class SessionService {
     }
   }
 
-  async listTemplates(): Promise<
-    Array<{ name: string; description?: string; languages: string[]; packages?: string[] }>
-  > {
+  async listTemplates(): Promise<SessionTemplate[]> {
     try {
       const { data } = await this.http.get('/sessions/templates')
       return data
@@ -234,10 +260,7 @@ export class SessionService {
     }
   }
 
-  async listPackages(
-    templateName: string,
-    language: string,
-  ): Promise<Array<{ name: string; version: string; hasNativeBindings?: boolean }>> {
+  async listPackages(templateName: string, language: string): Promise<SessionPackage[]> {
     try {
       const { data } = await this.http.get(`/sessions/templates/${encodeURIComponent(templateName)}/packages`, {
         params: { language },

@@ -45,6 +45,10 @@ export {
 export { Image } from './Image'
 export { SessionExpiredError, SessionInvalidatedError, SessionService } from './Session'
 export type {
+  CreateSessionOptions,
+  SessionAccess,
+  SessionContext,
+  SessionPackage,
   SessionRef,
   SessionDisplay,
   SessionExecutionError,
@@ -52,6 +56,7 @@ export type {
   SessionRunOptions,
   SessionRunResult,
   SessionRunStreamOptions,
+  SessionTemplate,
 } from './Session'
 export { Sandbox } from './Sandbox'
 export type { ListSandboxesQuery } from './Sandbox'

@@ -573,6 +573,7 @@ export class SessionService {
               if (displaysBytes <= MAX_AGGREGATE_OUTPUT_BYTES) {
                 displays.push({ formats: frame.formats, data: frame.data })
               } else {
+                displays.push({ formats: ['text/plain'], data: { 'text/plain': TRUNCATION_MARKER } })
                 displaysTruncated = true
               }
             }

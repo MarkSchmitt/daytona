@@ -108,13 +108,11 @@ new SessionInvalidatedError(sessionId: string, invalidatedAt: string): SessionIn
 
 SessionService is the user-facing SDK surface for the sessions product.
 
-The hot path (`run` / `runStream`) skips the Daytona API and talks directly
-to the in-sandbox session-daemon via the proxy chain — same shape
-`sandbox.process.code_run` uses against the classic daytona-daemon. The API
-is only hit on `createSession` / first one-shot / token refresh (every ~5
-min) / on invalidation. Legacy `POST /sessions/code-run` and
-`POST /sessions/connect` remain as transparent fallbacks for older API
-servers.
+Use `createSession` to start a persistent session and `run` / `runStream`
+to execute code against it. Calls to `run` / `runStream` can also be made
+without an explicit session — passing only a `template` / `language` — to
+execute one-shot code transparently. `listTemplates` and `listPackages`
+describe the runtimes available for sessions.
 
 ### Constructors
 
@@ -138,18 +136,12 @@ new SessionService(http: AxiosInstance): SessionService
 #### createSession()
 
 ```ts
-createSession(options: {
-  cwd: string;
-  language: string;
-  template: string;
-}): Promise<SessionRef>
+createSession(options: CreateSessionOptions): Promise<SessionRef>
 ```
 
 **Parameters**:
 
-- `options` _###### cwd?_ - `string`
-- `language?` _string_
-- `template?` _string_
+- `options` _CreateSessionOptions_
 
 
 **Returns**:
@@ -178,11 +170,7 @@ deleteSession(id: string): Promise<void>
 #### listPackages()
 
 ```ts
-listPackages(templateName: string, language: string): Promise<{
-  hasNativeBindings: boolean;
-  name: string;
-  version: string;
-}[]>
+listPackages(templateName: string, language: string): Promise<SessionPackage[]>
 ```
 
 **Parameters**:
@@ -193,11 +181,7 @@ listPackages(templateName: string, language: string): Promise<{
 
 **Returns**:
 
-- `Promise<{
-  hasNativeBindings: boolean;
-  name: string;
-  version: string;
- }[]>`
+- `Promise<SessionPackage[]>`
 
 ***
 
@@ -221,22 +205,12 @@ listSessions(template?: string): Promise<SessionRef[]>
 #### listTemplates()
 
 ```ts
-listTemplates(): Promise<{
-  description: string;
-  languages: string[];
-  name: string;
-  packages: string[];
-}[]>
+listTemplates(): Promise<SessionTemplate[]>
 ```
 
 **Returns**:
 
-- `Promise<{
-  description: string;
-  languages: string[];
-  name: string;
-  packages: string[];
- }[]>`
+- `Promise<SessionTemplate[]>`
 
 ***
 
@@ -277,24 +251,43 @@ runStream(code: string, options: SessionRunStreamOptions): Promise<SessionRunRes
 ***
 
 
+## CreateSessionOptions
+
+Options for SessionService.createSession.
+
+**Properties**:
+
+- `cwd?` _string_
+- `language?` _string_
+- `template?` _string_
 ## SessionAccess
 
-Signed direct-to-sandbox access bundle returned by the API.
+Signed access bundle for a session, returned by the API.
 
 **Properties**:
 
 - `httpUrl` _string_
 - `token` _string_
-- `tokenExpiresAt` _string_ - ISO timestamp; the SDK refreshes shortly before this.
+- `tokenExpiresAt` _string_ - ISO timestamp; the access is refreshed shortly before this.
 - `wsUrl` _string_
 
 
 
 
-The SDK opens a WebSocket directly to `wsUrl` on the in-sandbox session-daemon
-via the proxy chain — the URL is self-authenticating (the signed token lives
-in the proxy subdomain). `token` is exposed for revocation / observability;
-the SDK does NOT send it as an `Authorization` header.
+`token` is exposed for revocation / observability; the SDK does not send it
+as an `Authorization` header.
+## SessionContext
+
+**Properties**:
+
+- `access?` _SessionAccess_
+- `id` _string_
+
+
+
+
+Reference to an existing session to run code against, optionally carrying a
+primed access bundle to skip an extra access lookup.
 ## SessionDisplay
 
 **Properties**:
@@ -308,6 +301,15 @@ the SDK does NOT send it as an `Authorization` header.
 - `name` _string_
 - `traceback?` _string_
 - `value?` _string_
+## SessionPackage
+
+A package available within a session template.
+
+**Properties**:
+
+- `hasNativeBindings?` _boolean_
+- `name` _string_
+- `version` _string_
 ## SessionRef
 
 **Properties**:
@@ -325,11 +327,7 @@ the SDK does NOT send it as an `Authorization` header.
 
 **Properties**:
 
-- `access?` _SessionAccess_ - ##### id
-    
-    ```ts
-    id: string;
-    ```
+- `context?` _SessionContext_
 - `env?` _Record\<string, string\>_
 - `language?` _"typescript" \| "python" \| "javascript"_
 - `template?` _string_
@@ -345,7 +343,7 @@ the SDK does NOT send it as an `Authorization` header.
 
 - `displays` _SessionDisplay\[\]_
 - `durationMs` _number_
-- `error` _SessionExecutionError_
+- `error` _SessionExecutionError_ - The execution error, or `null` when the code ran successfully.
 - `stderr` _string_
 - `stdout` _string_
 ## SessionRunStreamOptions
@@ -354,15 +352,8 @@ the SDK does NOT send it as an `Authorization` header.
 
 **Properties**:
 
-- `access?` _SessionAccess_ - ##### id
-    
-    ```ts
-    id: string;
-    ```
-    
-    ##### Inherited from
-    
-    `SessionRunOptions`.`context`
+- `context?` _SessionContext_
+    - _Inherited from_: `SessionRunOptions.context`
 - `env?` _Record\<string, string\>_
     - _Inherited from_: `SessionRunOptions.env`
 - `language?` _"typescript" \| "python" \| "javascript"_
@@ -417,6 +408,16 @@ the SDK does NOT send it as an `Authorization` header.
 
 
 - `SessionRunOptions`
+## SessionTemplate
+
+A runtime template available for sessions.
+
+**Properties**:
+
+- `description?` _string_
+- `languages` _string\[\]_
+- `name` _string_
+- `packages?` _string\[\]_
 ## SessionFrameType
 
 ```ts

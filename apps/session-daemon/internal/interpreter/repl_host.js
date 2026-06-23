@@ -27,6 +27,15 @@ const fsp = require('node:fs/promises')
 // size on the Go side, regardless of how much the user code prints in one shot.
 const MAX_CHUNK_BYTES = 1 << 20 // 1 MiB
 
+// Max bytes for a whole serialized output line (one JSON frame + newline). Kept
+// safely below the Go reader's maxWorkerLineBytes (8 MiB) cap so even a frame
+// with many text/data fields — each individually within MAX_CHUNK_BYTES — can
+// never sum past the reader limit and trip its oversized-line recovery (which on
+// the shared host drains-and-skips without notifying the affected exec, so a
+// hung waiter is only avoided by keeping this path unreachable). Kept in sync
+// with MAX_LINE_BYTES in repl_worker.py.
+const MAX_LINE_BYTES = 4 << 20 // 4 MiB
+
 // truncateText caps a UTF-8 text payload at MAX_CHUNK_BYTES, appending a clear
 // marker reporting how many bytes were dropped. Returns the input untouched when
 // it is already within budget (the common case).
@@ -44,6 +53,23 @@ function truncateText(s) {
   const kept = buf.toString('utf8', 0, end)
   const omitted = byteLen - end
   return kept + `…[output truncated: ${omitted} bytes omitted]`
+}
+
+// shrinkFrame replaces a frame's text/data fields with a truncation marker.
+// Last-resort fallback for emit() when an entire serialized frame would exceed
+// MAX_LINE_BYTES (e.g. many fields each within MAX_CHUNK_BYTES but summing past
+// the reader cap). Drops the bulky payloads so the line is small while keeping
+// the frame's routing fields (sessionId/type/control text) intact. Mutates and
+// returns the same object.
+function shrinkFrame(chunk) {
+  const marker = '…[output truncated: frame exceeded line limit]'
+  if (typeof chunk.text === 'string') chunk.text = marker
+  if (typeof chunk.value === 'string') chunk.value = marker
+  if (typeof chunk.traceback === 'string') chunk.traceback = marker
+  if (chunk.data && typeof chunk.data === 'object') {
+    for (const mime of Object.keys(chunk.data)) chunk.data[mime] = marker
+  }
+  return chunk
 }
 
 // stdoutMutex / emit are declared FIRST because the boot-error catch handlers
@@ -75,7 +101,16 @@ function emit(chunk) {
   // Single-writer through stdoutMutex so concurrent sessions don't interleave bytes.
   stdoutMutex(() => {
     try {
-      process.stdout.write(JSON.stringify(chunk) + '\n')
+      let line = JSON.stringify(chunk)
+      // Whole-line guard: per-field truncation above bounds each text/data field,
+      // but a frame carrying many such fields could still serialize past the Go
+      // reader's line cap. If so, drop the oversized text/data fields (replacing
+      // them with a marker) so the emitted line is always under the reader limit
+      // and the host's drain-and-skip oversized-line recovery stays unreachable.
+      if (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES) {
+        line = JSON.stringify(shrinkFrame(chunk))
+      }
+      process.stdout.write(line + '\n')
     } catch (e) {
       process.stderr.write('emit failed: ' + e.message + '\n')
     }

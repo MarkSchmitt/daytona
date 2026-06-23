@@ -398,10 +398,11 @@ func (w *pythonSubprocessWorker) readLoop() {
 	for {
 		line, err := readBoundedLine(reader)
 		if errors.Is(err, errLineTooLong) {
-			// Over-long frame: the emit-side cap (MAX_CHUNK_BYTES) makes this
-			// unreachable in practice, but if it happens, surface an error for the
-			// current exec and recover rather than OOM or silently kill the worker.
-			// The worker is per-context so the blast radius is this one context.
+			// Over-long frame: the emit-side cap (per-field MAX_CHUNK_BYTES plus a
+			// whole-line guard in repl_worker.py's _emit) makes this unreachable in
+			// practice, but if it happens, surface an error for the current exec and
+			// recover rather than OOM or silently kill the worker. The worker is
+			// per-context so the blast radius is this one context.
 			w.logger.Warn("dropping oversized worker chunk", slog.Int("limit", maxWorkerLineBytes))
 			if w.onChunk != nil {
 				w.onChunk(&WorkerChunk{
@@ -415,6 +416,20 @@ func (w *pythonSubprocessWorker) readLoop() {
 					Type:      ChunkTypeControl,
 					Text:      ControlChunkTypeCompleted,
 				})
+			}
+			// The aborted command's REAL terminal frame (the `completed`/
+			// `interrupted` repl_worker.py always emits from its finally block) is
+			// still queued behind the oversized line — plus possibly more of the
+			// aborted command's trailing output. We have already synthesized a
+			// terminal pair above, so if we returned to the normal loop those stale
+			// frames would be mis-attributed to the NEXT queued command on this
+			// context. Drain the subprocess stdout until that real terminal frame so
+			// the next command starts on a clean boundary.
+			if drainErr := w.drainToTerminal(reader); drainErr != nil {
+				if !errors.Is(drainErr, io.EOF) {
+					w.logger.Debug("worker readLoop ended draining after oversized chunk", slog.String("error", drainErr.Error()))
+				}
+				return
 			}
 			continue
 		}
@@ -434,6 +449,38 @@ func (w *pythonSubprocessWorker) readLoop() {
 				w.logger.Debug("worker readLoop ended", slog.String("error", err.Error()))
 			}
 			return
+		}
+	}
+}
+
+// drainToTerminal discards frames from the subprocess stdout until (and
+// including) the aborted command's real terminal control frame — the
+// `completed`/`interrupted` chunk repl_worker.py always emits from its finally
+// block. It is called only on the oversized-frame recovery path, after a
+// synthetic terminal pair has already been delivered for the aborted command, to
+// prevent the aborted command's trailing frames from leaking into the NEXT
+// queued command on this context. Drained frames are NOT forwarded to onChunk
+// (the exec is already terminated). Oversized frames encountered while draining
+// are skipped too, so a runaway tail can't wedge the drain. Returns a read error
+// (including io.EOF) if the stream ends before a terminal frame is seen.
+func (w *pythonSubprocessWorker) drainToTerminal(reader *bufio.Reader) error {
+	for {
+		line, err := readBoundedLine(reader)
+		if errors.Is(err, errLineTooLong) {
+			// Another oversized frame in the aborted command's tail — keep draining.
+			continue
+		}
+		if len(line) > 0 {
+			var chunk WorkerChunk
+			if jerr := json.Unmarshal([]byte(line), &chunk); jerr == nil &&
+				chunk.Type == ChunkTypeControl &&
+				(chunk.Text == ControlChunkTypeCompleted || chunk.Text == ControlChunkTypeInterrupted) {
+				// Real terminal frame consumed — the stream is resynchronized.
+				return nil
+			}
+		}
+		if err != nil {
+			return err
 		}
 	}
 }

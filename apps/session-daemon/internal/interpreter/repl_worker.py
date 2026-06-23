@@ -43,6 +43,13 @@ except Exception:  # noqa: BLE001
 # user code prints in one shot. Kept in sync with MAX_CHUNK_BYTES in repl_host.js.
 MAX_CHUNK_BYTES = 1 << 20  # 1 MiB
 
+# Max bytes for a whole serialized output line (one JSON frame + newline). Kept
+# safely below the Go reader's maxWorkerLineBytes (8 MiB) cap so even a frame with
+# many text/data fields — each individually within MAX_CHUNK_BYTES — can never sum
+# past the reader limit and trip its oversized-line recovery. Kept in sync with
+# MAX_LINE_BYTES in repl_host.js.
+MAX_LINE_BYTES = 4 << 20  # 4 MiB
+
 
 def _truncate_text(s: str) -> str:
     """Cap a text payload at MAX_CHUNK_BYTES, appending an omitted-bytes marker.
@@ -58,6 +65,24 @@ def _truncate_text(s: str) -> str:
     kept = encoded[:MAX_CHUNK_BYTES].decode("utf-8", "ignore")
     omitted = len(encoded) - len(kept.encode("utf-8"))
     return f"{kept}…[output truncated: {omitted} bytes omitted]"
+
+
+def _shrink_frame(chunk: dict) -> dict:
+    """Replace a frame's text/data fields with a truncation marker.
+
+    Last-resort fallback for _emit when an entire serialized frame would exceed
+    MAX_LINE_BYTES (e.g. many fields each within MAX_CHUNK_BYTES but summing past
+    the reader cap). Drops the bulky payloads so the line is small while keeping
+    the frame's routing fields (type/name/control text) intact. Mutates and
+    returns the same dict.
+    """
+    marker = "…[output truncated: frame exceeded line limit]"
+    for key in ("text", "value", "traceback"):
+        if isinstance(chunk.get(key), str):
+            chunk[key] = marker
+    if isinstance(chunk.get("data"), dict):
+        chunk["data"] = {mime: marker for mime in chunk["data"]}
+    return chunk
 
 
 class REPLWorker:
@@ -94,7 +119,16 @@ class REPLWorker:
                 if isinstance(payload, str):
                     data[mime] = _truncate_text(payload)
         try:
-            json.dump(chunk, sys.__stdout__)
+            line = json.dumps(chunk)
+            # Whole-line guard: per-field truncation above bounds each text/data
+            # field, but a frame carrying many such fields could still serialize
+            # past the Go reader's line cap. If so, drop the oversized text/data
+            # fields (replacing them with a marker) so the emitted line is always
+            # under the reader limit and the host's oversized-line recovery stays
+            # unreachable for well-behaved output.
+            if len(line.encode("utf-8")) > MAX_LINE_BYTES:
+                line = json.dumps(_shrink_frame(chunk))
+            sys.__stdout__.write(line)
             sys.__stdout__.write("\n")
             sys.__stdout__.flush()
         except Exception as e:  # noqa: BLE001
