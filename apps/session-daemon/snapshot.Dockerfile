@@ -56,7 +56,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Curated Python venv. Pinning is intentional — see plan §1: snapshot is the
 # only install path, runtime install is not supported in v1. Bumping these
 # requires rebuilding the image (and republishing the python-default snapshot).
-# Versions are pinned so builds are byte-for-byte reproducible.
+# Direct dependency versions are pinned for build stability; note transitive
+# deps, OS packages, and the base image tag are not hash-pinned, so builds are
+# stable but not byte-for-byte reproducible.
 RUN python3 -m venv /opt/daytona/venv && \
     /opt/daytona/venv/bin/pip install --no-cache-dir --upgrade pip && \
     /opt/daytona/venv/bin/pip install --no-cache-dir \
@@ -104,7 +106,7 @@ RUN mkdir -p /usr/lib/daytona/repl_host && cd /usr/lib/daytona/repl_host \
 RUN set -e; \
     case "${SESSION_DAEMON_URL}" in \
       https://*) : ;; \
-      http://localhost*|http://127.0.0.1*|http://[::1]*) : ;; \
+      'http://localhost'|'http://localhost:'*|'http://localhost/'*|'http://127.0.0.1'|'http://127.0.0.1:'*|'http://127.0.0.1/'*|'http://[::1]'|'http://[::1]:'*|'http://[::1]/'*) : ;; \
       *) echo "SESSION_DAEMON_URL must use https:// (or http://localhost for local builds); refusing insecure transport: ${SESSION_DAEMON_URL}" >&2; exit 1 ;; \
     esac; \
     mkdir -p /opt/daytona; \
@@ -120,7 +122,7 @@ RUN set -e; \
 # Run as an unprivileged user. The daemon binds loopback-only and needs no
 # privileged ports; /workspace must stay writable for user code and node_modules.
 RUN useradd --system --create-home --home-dir /home/daytona --shell /usr/sbin/nologin daytona \
-    && chown -R daytona:daytona /workspace /opt/daytona
+    && chown -R daytona:daytona /workspace
 USER daytona
 # NOTE: do not invoke the daemon here as a smoke test. It takes no --version/
 # --help flag (see apps/session-daemon/cmd/main.go); any invocation starts the

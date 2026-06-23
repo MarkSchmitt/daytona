@@ -65,7 +65,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Curated Python venv. Pinning here is intentional — see plan §1: snapshot is
 # the only install path, runtime install is not supported in v1. Bumping these
 # requires rebuilding the image (and republishing the python-default snapshot).
-# Versions are pinned so builds are byte-for-byte reproducible.
+# Direct dependency versions are pinned for build stability; note transitive
+# deps, OS packages, and the base image tag are not hash-pinned, so builds are
+# stable but not byte-for-byte reproducible.
 RUN python3 -m venv /opt/daytona/venv && \
     /opt/daytona/venv/bin/pip install --no-cache-dir --upgrade pip && \
     /opt/daytona/venv/bin/pip install --no-cache-dir \
@@ -97,7 +99,7 @@ RUN chmod +x /opt/daytona/session-daemon
 # Run as an unprivileged user. The daemon binds loopback-only and needs no
 # privileged ports; /workspace must stay writable for user code and node_modules.
 RUN useradd --system --create-home --home-dir /home/daytona --shell /usr/sbin/nologin daytona \
-    && chown -R daytona:daytona /workspace /opt/daytona
+    && chown -R daytona:daytona /workspace
 USER daytona
 
 # Healthcheck targets the loopback port the daemon binds to. Because the daemon
