@@ -885,19 +885,12 @@ export class Daytona implements AsyncDisposable {
       },
     )
 
-    axiosInstance.interceptors.response.use(
-      (response) => {
-        return response
-      },
-      (error) => {
-        if (error instanceof AxiosError) {
-          throw createAxiosDaytonaError(error)
-        }
-
-        throw new DaytonaError(error instanceof Error ? error.message : String(error))
-      },
-    )
-
+    // Metrics interceptor is registered BEFORE the error-normalization interceptor.
+    // Axios runs response interceptors in registration order (FIFO) on both the
+    // fulfilled and rejected paths, so this guarantees the metrics handler observes
+    // the still-raw AxiosError (with its `config` and `response`) before the
+    // normalizer converts it into a DaytonaError, which does not preserve those
+    // fields. Otherwise the failure-span metrics would be silently skipped.
     axiosInstance.interceptors.response.use(
       (response) => {
         const startTime = (response.config as any).metadata?.startTime
@@ -949,6 +942,19 @@ export class Daytona implements AsyncDisposable {
         }
 
         return Promise.reject(error)
+      },
+    )
+
+    axiosInstance.interceptors.response.use(
+      (response) => {
+        return response
+      },
+      (error) => {
+        if (error instanceof AxiosError) {
+          throw createAxiosDaytonaError(error)
+        }
+
+        throw new DaytonaError(error instanceof Error ? error.message : String(error))
       },
     )
 

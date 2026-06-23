@@ -54,6 +54,31 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _finalize_disconnect(
+    aggregated: SessionRunResult,
+    completed: bool,
+    started_at: float,
+    exc: Optional[BaseException] = None,
+) -> SessionRunResult:
+    """Finalize a streamed run: surface an abnormal disconnect and stamp duration.
+
+    `completed` is True once the daemon's terminal control frame
+    ("completed"/"interrupted") was seen. If the stream ended — or `exc` was
+    raised — before that frame, the run disconnected abnormally and we surface a
+    `SessionDisconnected` error, unless the daemon already reported a real error.
+    """
+    if not completed:
+        disconnect_error = (
+            f"session websocket disconnected mid-run: {exc}"
+            if exc is not None
+            else "session websocket closed before run completed"
+        )
+        if aggregated.error is None:
+            aggregated.error = SessionExecutionError(name="SessionDisconnected", value=disconnect_error)
+    aggregated.duration_ms = int((time.time() - started_at) * 1000)
+    return aggregated
+
+
 def _load_websockets(error_prefix: str = "direct session execution") -> tuple[Any, Any, Any]:
     """Lazy-load the optional `websockets` dep and return (connect, InvalidStatusCode, WebSocketException).
 
@@ -318,7 +343,7 @@ class AsyncSessionService:
         # is an abnormal disconnect and must surface as an error, not a silent
         # success.
         completed = False
-        disconnect_error: Optional[str] = None
+        disconnect_exc: Optional[BaseException] = None
         try:
             async for raw in ws:
                 if isinstance(raw, bytes):
@@ -333,15 +358,9 @@ class AsyncSessionService:
                     completed = True
                 await self._apply_frame(frame, aggregated, handlers)
             # Stream ended. Clean only if we already saw the terminal frame.
-            if not completed:
-                disconnect_error = "session websocket closed before run completed"
         except Exception as exc:  # noqa: BLE001
-            if not completed:
-                disconnect_error = f"session websocket disconnected mid-run: {exc}"
-        if disconnect_error is not None and aggregated.error is None:
-            aggregated.error = SessionExecutionError(name="SessionDisconnected", value=disconnect_error)
-        aggregated.duration_ms = int((time.time() - started_at) * 1000)
-        return aggregated
+            disconnect_exc = exc
+        return _finalize_disconnect(aggregated, completed, started_at, disconnect_exc)
 
     async def _fetch_session_access(self, session_id: str) -> SessionAccess:
         async with aiohttp.ClientSession(headers=self._headers) as session:
@@ -471,7 +490,7 @@ class AsyncSessionService:
                 )
             )
             completed = False
-            disconnect_error: Optional[str] = None
+            disconnect_exc: Optional[BaseException] = None
             try:
                 async for frame in ws:
                     raw: str = frame.decode("utf-8", errors="replace") if isinstance(frame, bytes) else cast(str, frame)
@@ -484,15 +503,9 @@ class AsyncSessionService:
                     if frame.get("type") == "control" and frame.get("text") in ("completed", "interrupted"):
                         completed = True
                     await self._apply_frame(frame, aggregated, handlers)
-                if not completed:
-                    disconnect_error = "session websocket closed before run completed"
             except Exception as exc:  # noqa: BLE001
-                if not completed:
-                    disconnect_error = f"session websocket disconnected mid-run: {exc}"
-        if disconnect_error is not None and aggregated.error is None:
-            aggregated.error = SessionExecutionError(name="SessionDisconnected", value=disconnect_error)
-        aggregated.duration_ms = int((time.time() - started_at) * 1000)
-        return aggregated
+                disconnect_exc = exc
+        return _finalize_disconnect(aggregated, completed, started_at, disconnect_exc)
 
     # -- helpers --------------------------------------------------------
 

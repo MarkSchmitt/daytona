@@ -51,6 +51,31 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _finalize_disconnect(
+    aggregated: SessionRunResult,
+    completed: bool,
+    started_at: float,
+    exc: Optional[BaseException] = None,
+) -> SessionRunResult:
+    """Finalize a streamed run: surface an abnormal disconnect and stamp duration.
+
+    `completed` is True once the daemon's terminal control frame
+    ("completed"/"interrupted") was seen. If the stream ended — or `exc` was
+    raised — before that frame, the run disconnected abnormally and we surface a
+    `SessionDisconnected` error, unless the daemon already reported a real error.
+    """
+    if not completed:
+        disconnect_error = (
+            f"session websocket disconnected mid-run: {exc}"
+            if exc is not None
+            else "session websocket closed before run completed"
+        )
+        if aggregated.error is None:
+            aggregated.error = SessionExecutionError(name="SessionDisconnected", value=disconnect_error)
+    aggregated.duration_ms = int((time.time() - started_at) * 1000)
+    return aggregated
+
+
 class _LegacyFallback(Exception):
     """Signal: API endpoint not available on this server; degrade to /code-run."""
 
@@ -325,18 +350,15 @@ class SessionService:
         # frame is an abnormal disconnect and must surface as an error, not a
         # silent success.
         completed = False
-        disconnect_error: Optional[str] = None
+        disconnect_exc: Optional[BaseException] = None
         while True:
             try:
                 raw = ws.recv()
             except Exception as exc:  # noqa: BLE001
-                if not completed:
-                    disconnect_error = f"session websocket disconnected mid-run: {exc}"
+                disconnect_exc = exc
                 break
             if raw is None or raw == "":
                 # End of stream. Clean only if we already saw the terminal frame.
-                if not completed:
-                    disconnect_error = "session websocket closed before run completed"
                 break
             try:
                 frame = json.loads(raw)
@@ -345,10 +367,7 @@ class SessionService:
             if frame.get("type") == "control" and frame.get("text") in ("completed", "interrupted"):
                 completed = True
             self._apply_frame(frame, aggregated, handlers)
-        if disconnect_error is not None and aggregated.error is None:
-            aggregated.error = SessionExecutionError(name="SessionDisconnected", value=disconnect_error)
-        aggregated.duration_ms = int((time.time() - started_at) * 1000)
-        return aggregated
+        return _finalize_disconnect(aggregated, completed, started_at, disconnect_exc)
 
     def _fetch_session_access(self, session_id: str) -> SessionAccess:
         try:

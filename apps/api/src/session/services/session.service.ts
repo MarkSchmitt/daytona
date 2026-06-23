@@ -477,10 +477,22 @@ export class SessionService {
       handshakeTimeout: this.config.get('session.healthcheckTimeoutMs') ?? 60000,
     })
 
+    // Aggregate output is buffered in-memory in the shared multi-tenant API process,
+    // so an unbounded run would be a heap-pressure/DoS vector. Cap each stream (and the
+    // displays array) at 5 MiB; once a stream hits the cap we stop appending and add a
+    // single truncation marker. Small-output runs are unaffected.
+    const MAX_AGGREGATE_OUTPUT_BYTES = 5 * 1024 * 1024
+    const TRUNCATION_MARKER = '\n…[output truncated]…'
     let stdout = ''
     let stderr = ''
+    let stdoutBytes = 0
+    let stderrBytes = 0
+    let stdoutTruncated = false
+    let stderrTruncated = false
     let execError: ExecutionErrorDto | undefined
     const displays: DisplayDataDto[] = []
+    let displaysBytes = 0
+    let displaysTruncated = false
 
     return new Promise((resolve, reject) => {
       const hardTimeoutMs =
@@ -525,10 +537,28 @@ export class SessionService {
         }
         switch (frame.type) {
           case 'stdout':
-            stdout += frame.text ?? ''
+            if (!stdoutTruncated) {
+              const chunk = frame.text ?? ''
+              stdoutBytes += Buffer.byteLength(chunk, 'utf8')
+              if (stdoutBytes <= MAX_AGGREGATE_OUTPUT_BYTES) {
+                stdout += chunk
+              } else {
+                stdout += TRUNCATION_MARKER
+                stdoutTruncated = true
+              }
+            }
             break
           case 'stderr':
-            stderr += frame.text ?? ''
+            if (!stderrTruncated) {
+              const chunk = frame.text ?? ''
+              stderrBytes += Buffer.byteLength(chunk, 'utf8')
+              if (stderrBytes <= MAX_AGGREGATE_OUTPUT_BYTES) {
+                stderr += chunk
+              } else {
+                stderr += TRUNCATION_MARKER
+                stderrTruncated = true
+              }
+            }
             break
           case 'error':
             execError = {
@@ -538,8 +568,13 @@ export class SessionService {
             }
             break
           case 'display':
-            if (frame.formats && frame.data) {
-              displays.push({ formats: frame.formats, data: frame.data })
+            if (frame.formats && frame.data && !displaysTruncated) {
+              displaysBytes += Object.values(frame.data).reduce((acc, d) => acc + Buffer.byteLength(d ?? '', 'utf8'), 0)
+              if (displaysBytes <= MAX_AGGREGATE_OUTPUT_BYTES) {
+                displays.push({ formats: frame.formats, data: frame.data })
+              } else {
+                displaysTruncated = true
+              }
             }
             break
           case 'control':
