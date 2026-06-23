@@ -375,6 +375,29 @@ const configuration = {
       gcBatchSize: parseInt(process.env.SESSION_GC_BATCH_SIZE || '500', 10),
       expiredGracePeriodSeconds: parseInt(process.env.SESSION_EXPIRED_GRACE_SECONDS || '86400', 10),
     },
+    // Hybrid autoscaling of the warm-sandbox fleet per (org, template). See
+    // apps/api/src/session/docs/scale-out.md.
+    scale: {
+      // Always-on warm sandboxes kept ready per (org, template).
+      minWarm: parseInt(process.env.SESSION_MIN_WARM || '1', 10),
+      // Hard ceiling on instances (warm + overflow) per (org, template).
+      maxInstancesPerTemplate: parseInt(process.env.SESSION_MAX_INSTANCES_PER_TEMPLATE || '5', 10),
+      // Logical concurrency a single sandbox should serve before it is considered
+      // saturated and the scheduler prefers another / provisions a new one.
+      targetConcurrencyPerSandbox: parseInt(process.env.SESSION_TARGET_CONCURRENCY_PER_SANDBOX || '4', 10),
+      // How often the load poller refreshes each instance's daemon /load snapshot.
+      loadPollMs: parseInt(process.env.SESSION_LOAD_POLL_MS || '5000', 10),
+      // TTL on cached load snapshots / in-flight counters so a crashed API node
+      // can't pin an instance "busy" forever.
+      loadTtlSeconds: parseInt(process.env.SESSION_LOAD_TTL_SECONDS || '30', 10),
+      // An overflow instance idle for at least this long is eligible for scale-in.
+      scaleInIdleSeconds: parseInt(process.env.SESSION_SCALE_IN_IDLE_SECONDS || '600', 10),
+      // Resource-pressure saturation thresholds (cgroup-aware, reported by the daemon).
+      // PSI "some avg10" percentage for CPU; fractional utilization for mem/disk.
+      cpuPressureThreshold: parseFloat(process.env.SESSION_CPU_PRESSURE_THRESHOLD || '50'),
+      memUtilThreshold: parseFloat(process.env.SESSION_MEM_UTIL_THRESHOLD || '0.85'),
+      diskUtilThreshold: parseFloat(process.env.SESSION_DISK_UTIL_THRESHOLD || '0.9'),
+    },
   },
 }
 

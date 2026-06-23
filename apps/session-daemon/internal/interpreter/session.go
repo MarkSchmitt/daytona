@@ -64,9 +64,16 @@ func (c *Session) processQueue() {
 	}
 }
 
+// IsBusy reports whether the context currently has an exec in flight. Used by the
+// manager's /load aggregation.
+func (c *Session) IsBusy() bool { return c.busy.Load() > 0 }
+
 // runJob is the per-execution sequence: tag the active command, send the worker
 // the exec frame, await the terminal control chunk (or a timeout), then return.
 func (c *Session) runJob(job execJob) (*CommandExecution, error) {
+	c.busy.Add(1)
+	defer c.busy.Add(-1)
+
 	cmdID := uuid.NewString()
 	exec := &CommandExecution{
 		ID:        cmdID,

@@ -6,6 +6,7 @@ package interpreter
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -201,6 +202,11 @@ type Session struct {
 
 	activeCommand *CommandExecution
 	commandMu     sync.Mutex
+
+	// busy is the number of in-flight execs on this context (0 or 1 in practice — the
+	// FIFO queue serializes execs per context). Tracked separately from activeCommand so
+	// the /load endpoint can count "busy" contexts without taking commandMu under load.
+	busy atomic.Int64
 
 	// Currently attached WebSocket client (only one at a time).
 	client *wsClient

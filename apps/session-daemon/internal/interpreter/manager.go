@@ -237,6 +237,24 @@ func (m *Manager) Healthz() bool {
 	return true
 }
 
+// LoadCounts returns a snapshot of context concurrency for the /load endpoint:
+// total active contexts, contexts with an in-flight exec, and the per-language caps.
+func (m *Manager) LoadCounts() (active, busy, pyMax, tsMax int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	active = len(m.contexts)
+	for _, c := range m.contexts {
+		if c.IsBusy() {
+			busy++
+		}
+	}
+	return active, busy, m.cfg.PyMaxContexts, m.cfg.TSMaxContexts
+}
+
+// WorkspaceRoot exposes the configured workspace root so the server can statfs the
+// sandbox's own volume for the /load disk metric.
+func (m *Manager) WorkspaceRoot() string { return m.cfg.WorkspaceRoot }
+
 func normalizeLanguage(lang string) string {
 	switch lang {
 	case LanguageJavaScript:

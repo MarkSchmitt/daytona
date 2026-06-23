@@ -18,15 +18,17 @@ import (
 
 	"github.com/daytonaio/session-daemon/internal/config"
 	"github.com/daytonaio/session-daemon/internal/interpreter"
+	"github.com/daytonaio/session-daemon/internal/loadstat"
 )
 
 // Server is the HTTP+WS surface of the session-daemon. It listens on
 // 127.0.0.1:<port> by default and relies on the proxy chain for auth.
 type Server struct {
-	cfg     *config.Config
-	logger  *slog.Logger
-	manager *interpreter.Manager
-	httpSrv *http.Server
+	cfg       *config.Config
+	logger    *slog.Logger
+	manager   *interpreter.Manager
+	httpSrv   *http.Server
+	loadStats *loadstat.Collector
 }
 
 // NewServer wires up the manager + worker factories and prepares an HTTP/Gin
@@ -46,7 +48,12 @@ func NewServer(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	}
 
 	mgr := interpreter.NewManager(cfg, logger, pyFactory, asWorkerFactory(tsFactory))
-	return &Server{cfg: cfg, logger: logger, manager: mgr}, nil
+	return &Server{
+		cfg:       cfg,
+		logger:    logger,
+		manager:   mgr,
+		loadStats: loadstat.NewCollector("", cfg.WorkspaceRoot),
+	}, nil
 }
 
 // asWorkerFactory adapts *TSFactory to the WorkerFactory interface, returning a
@@ -71,6 +78,7 @@ func (s *Server) Run(ctx context.Context) error {
 	r.DELETE("/sessions/:id", s.handleDeleteSession)
 	r.GET("/sessions/:id/execute", s.handleExecute)
 	r.GET("/packages", s.handleListPackages)
+	r.GET("/load", s.handleLoad)
 
 	addr := net.JoinHostPort(s.cfg.BindAddr, strconv.Itoa(s.cfg.Port))
 	s.httpSrv = &http.Server{
@@ -135,6 +143,34 @@ func (s *Server) handleCreateSession(c *gin.Context) {
 
 func (s *Server) handleListSessions(c *gin.Context) {
 	c.JSON(http.StatusOK, s.manager.ListSessions())
+}
+
+// handleLoad reports the daemon's self-observed load for the API's scheduler: logical
+// concurrency (active/busy contexts vs caps) plus cgroup-aware resource pressure. Resource
+// sub-blocks are omitted when cgroup files aren't readable, so the API falls back to
+// concurrency-only saturation.
+func (s *Server) handleLoad(c *gin.Context) {
+	active, busy, pyMax, tsMax := s.manager.LoadCounts()
+	resp := gin.H{
+		"activeContexts": active,
+		"busyContexts":   busy,
+		"pyMax":          pyMax,
+		"tsMax":          tsMax,
+	}
+	sample := s.loadStats.Sample(time.Now())
+	if sample.CPU != nil {
+		resp["cpu"] = sample.CPU
+	}
+	if sample.Memory != nil {
+		resp["memory"] = sample.Memory
+	}
+	if sample.IO != nil {
+		resp["io"] = sample.IO
+	}
+	if sample.Disk != nil {
+		resp["disk"] = sample.Disk
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func (s *Server) handleDeleteSession(c *gin.Context) {

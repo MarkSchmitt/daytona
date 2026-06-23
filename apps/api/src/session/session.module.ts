@@ -12,6 +12,8 @@ import { SessionTemplateService } from './services/session-template.service'
 import { SessionRepository } from './services/session-repository.service'
 import { SessionGcService } from './services/session-gc.service'
 import { SessionPoolService } from './services/session-pool.service'
+import { SessionLoadService } from './services/session-load.service'
+import { SessionScheduler } from './services/session-scheduler.service'
 import { SessionService } from './services/session.service'
 import { SessionController } from './controllers/session.controller'
 import { SandboxModule } from '../sandbox/sandbox.module'
@@ -32,7 +34,15 @@ import { Sandbox } from '../sandbox/entities/sandbox.entity'
     TypeOrmModule.forFeature([SessionTemplate, SessionInstance, Session, Sandbox]),
   ],
   controllers: [SessionController],
-  providers: [SessionTemplateService, SessionRepository, SessionGcService, SessionPoolService, SessionService],
+  providers: [
+    SessionTemplateService,
+    SessionRepository,
+    SessionGcService,
+    SessionLoadService,
+    SessionScheduler,
+    SessionPoolService,
+    SessionService,
+  ],
   exports: [SessionService, SessionRepository, SessionPoolService, SessionTemplateService],
 })
 export class SessionModule {}
