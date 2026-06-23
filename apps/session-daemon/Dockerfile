@@ -52,7 +52,9 @@ ENV SESSION_DAEMON_USER_NODE_MODULES_ROOT=/workspace
 ENV SESSION_DAEMON_NODE_BUNDLE_ROOT=/usr/lib/daytona/repl_host
 ENV PATH="/opt/daytona/venv/bin:${PATH}"
 
-# OS deps + Python + Node.js 22
+# OS deps + Python (3.11, the version debian:bookworm ships) + Node.js 22.
+# These majors are the source of truth for the seed migration's metadata
+# (apps/api/src/migrations/post-deploy/1778367241001-migration.ts) and README.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl python3 python3-venv python3-pip build-essential \
       libffi-dev libssl-dev pkg-config \
@@ -63,31 +65,40 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Curated Python venv. Pinning here is intentional — see plan §1: snapshot is
 # the only install path, runtime install is not supported in v1. Bumping these
 # requires rebuilding the image (and republishing the python-default snapshot).
+# Versions are pinned so builds are byte-for-byte reproducible.
 RUN python3 -m venv /opt/daytona/venv && \
     /opt/daytona/venv/bin/pip install --no-cache-dir --upgrade pip && \
     /opt/daytona/venv/bin/pip install --no-cache-dir \
-      numpy pandas matplotlib requests httpx pydantic openai anthropic
+      numpy==2.2.1 pandas==2.2.3 matplotlib==3.10.0 requests==2.32.3 \
+      httpx==0.28.1 pydantic==2.10.4 openai==1.59.6 anthropic==0.42.0
 
 # Curated user-side node_modules. Pure-JS only (no native bindings) — V8 session
-# constraint, see plan §1.
+# constraint, see plan §1. Versions pinned for reproducible builds.
 RUN mkdir -p /workspace && cd /workspace \
     && npm init -y >/dev/null \
     && npm install --omit=optional --omit=peer \
-        zod lodash-es date-fns papaparse marked openai @anthropic-ai/sdk \
+        zod@3.24.1 lodash-es@4.17.21 date-fns@4.1.0 papaparse@5.4.1 \
+        marked@15.0.6 openai@4.77.3 @anthropic-ai/sdk@0.33.1 \
     && rm -rf /root/.npm
 
 # Host-side bundle dependencies (isolated-vm, esbuild-wasm). isolated-vm has
 # native bindings compiled against this image's node version at install time;
 # baking it into the image (rather than runtime install) is what makes
 # cold-start fast. Per plan §1, the daemon's //go:embed only carries the entry
-# script — heavy deps live in the image layer.
+# script — heavy deps live in the image layer. Pinned to exact patch versions.
 RUN mkdir -p /usr/lib/daytona/repl_host && cd /usr/lib/daytona/repl_host \
     && npm init -y >/dev/null \
-    && npm install --omit=optional --omit=peer isolated-vm@5 esbuild-wasm@0.24 \
+    && npm install --omit=optional --omit=peer isolated-vm@5.0.3 esbuild-wasm@0.24.2 \
     && rm -rf /root/.npm
 
 COPY --from=build /daytona/dist/apps/session-daemon /opt/daytona/session-daemon
 RUN chmod +x /opt/daytona/session-daemon
+
+# Run as an unprivileged user. The daemon binds loopback-only and needs no
+# privileged ports; /workspace must stay writable for user code and node_modules.
+RUN useradd --system --create-home --home-dir /home/daytona --shell /usr/sbin/nologin daytona \
+    && chown -R daytona:daytona /workspace /opt/daytona
+USER daytona
 
 # Healthcheck targets the loopback port the daemon binds to. Because the daemon
 # is loopback-only, only an in-container healthcheck makes sense.

@@ -8,6 +8,7 @@ import { SessionPoolService } from './session-pool.service'
 import { SessionInstance } from '../entities/session-instance.entity'
 import { SessionInstanceState } from '../enums/session-instance-state.enum'
 import { SessionInstanceRole } from '../enums/session-instance-role.enum'
+import { SandboxState } from '../../sandbox/enums/sandbox-state.enum'
 import { TypedConfigService } from '../../config/typed-config.service'
 
 const ORG = 'org-1'
@@ -48,11 +49,15 @@ function makePool(readyInstances: SessionInstance[], loads: Record<string, numbe
   const sandboxService = { destroy: jest.fn(async () => undefined) }
   const sessions = { markInstanceSessionsInvalid: jest.fn(async () => undefined) }
   const load = { effectiveLoad: jest.fn(async (id: string) => loads[id] ?? 0) }
+  // rollInstance now destroys the live sandbox; the repo answers with a STARTED row per instance.
+  const sandboxRepo = {
+    findOne: jest.fn(async ({ where: { id } }: any) => ({ id, state: SandboxState.STARTED })),
+  }
 
   const pool = new SessionPoolService(
     instanceRepo as any,
     {} as any, // templateRepo
-    {} as any, // sandboxRepo
+    sandboxRepo as any,
     sandboxService as any,
     sessions as any,
     {} as any, // lockProvider
@@ -60,7 +65,7 @@ function makePool(readyInstances: SessionInstance[], loads: Record<string, numbe
     load as any,
     {} as any, // scheduler
   )
-  return { pool, instanceRepo, sandboxService, sessions, load }
+  return { pool, instanceRepo, sandboxService, sessions, load, sandboxRepo }
 }
 
 function withConfig(pool: SessionPoolService, cfg: TypedConfigService): void {

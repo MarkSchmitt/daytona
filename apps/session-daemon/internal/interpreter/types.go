@@ -15,6 +15,9 @@ const (
 	writeWait         = 10 * time.Second
 	gracePeriod       = 2 * time.Second
 	workerScriptPerms = 0o700
+	// createAckTimeout bounds how long TSFactory.Create waits for the host's
+	// "created"/error acknowledgment so a stalled host can't hang Create forever.
+	createAckTimeout = 15 * time.Second
 )
 
 // WebSocket close codes (4000-4999 are for private/application use).
@@ -207,6 +210,12 @@ type Session struct {
 	// FIFO queue serializes execs per context). Tracked separately from activeCommand so
 	// the /load endpoint can count "busy" contexts without taking commandMu under load.
 	busy atomic.Int64
+
+	// inflight counts execs Enqueued but not yet completed (queued OR running).
+	// Incremented before the queue send so the idle sweeper cannot delete a context
+	// out from under a just-accepted job — busy and LastUsedAt only update once the
+	// queue goroutine starts runJob, which can lag the Enqueue.
+	inflight atomic.Int64
 
 	// Currently attached WebSocket client (only one at a time).
 	client *wsClient

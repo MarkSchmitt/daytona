@@ -313,6 +313,12 @@ class AsyncSessionService:
     ) -> SessionRunResult:
         aggregated = SessionRunResult(stdout="", stderr="", error=None, displays=[], duration_ms=0)
         started_at = time.time()
+        # The daemon emits a terminal control frame ("completed"/"interrupted")
+        # to signal a clean end-of-run. A stream error / end BEFORE that frame
+        # is an abnormal disconnect and must surface as an error, not a silent
+        # success.
+        completed = False
+        disconnect_error: Optional[str] = None
         try:
             async for raw in ws:
                 if isinstance(raw, bytes):
@@ -323,9 +329,17 @@ class AsyncSessionService:
                     frame = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
+                if frame.get("type") == "control" and frame.get("text") in ("completed", "interrupted"):
+                    completed = True
                 await self._apply_frame(frame, aggregated, handlers)
-        except Exception:  # noqa: BLE001 — closed mid-stream is the normal exit.
-            pass
+            # Stream ended. Clean only if we already saw the terminal frame.
+            if not completed:
+                disconnect_error = "session websocket closed before run completed"
+        except Exception as exc:  # noqa: BLE001
+            if not completed:
+                disconnect_error = f"session websocket disconnected mid-run: {exc}"
+        if disconnect_error is not None and aggregated.error is None:
+            aggregated.error = SessionExecutionError(name="SessionDisconnected", value=disconnect_error)
         aggregated.duration_ms = int((time.time() - started_at) * 1000)
         return aggregated
 
@@ -456,6 +470,8 @@ class AsyncSessionService:
                     }
                 )
             )
+            completed = False
+            disconnect_error: Optional[str] = None
             try:
                 async for frame in ws:
                     raw: str = frame.decode("utf-8", errors="replace") if isinstance(frame, bytes) else cast(str, frame)
@@ -465,9 +481,16 @@ class AsyncSessionService:
                         frame = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
+                    if frame.get("type") == "control" and frame.get("text") in ("completed", "interrupted"):
+                        completed = True
                     await self._apply_frame(frame, aggregated, handlers)
-            except Exception:  # noqa: BLE001 — closed mid-stream is normal
-                pass
+                if not completed:
+                    disconnect_error = "session websocket closed before run completed"
+            except Exception as exc:  # noqa: BLE001
+                if not completed:
+                    disconnect_error = f"session websocket disconnected mid-run: {exc}"
+        if disconnect_error is not None and aggregated.error is None:
+            aggregated.error = SessionExecutionError(name="SessionDisconnected", value=disconnect_error)
         aggregated.duration_ms = int((time.time() - started_at) * 1000)
         return aggregated
 
@@ -495,13 +518,17 @@ class AsyncSessionService:
         if not isinstance(payload, dict):
             return True
         body_dict: dict[str, Any] = cast("dict[str, Any]", payload)
+        # Nest's unknown-route 404 wraps an object like
+        # {"message":"Cannot GET ...","error":"Not Found","statusCode":404}. A
+        # genuine missing-session NotFoundException carries the SAME
+        # error:"Not Found" but a descriptive message ("Session <id> not
+        # found."), so we must NOT key off `error` — only the message (or its
+        # absence) is a reliable route-missing signal.
         msg = body_dict.get("message")
-        if isinstance(msg, str) and msg.startswith(("Cannot ", "Not Found")):
-            return True
-        err: Any = body_dict.get("error")
-        if isinstance(err, str) and err == "Not Found":
-            return True
-        return False
+        if isinstance(msg, str):
+            return msg.startswith("Cannot ") or msg.strip() == ""
+        # No message field at all → not a recognizable missing-session envelope.
+        return True
 
     def _build_run_body(self, code: str, options: Optional[SessionRunOptions]) -> dict[str, Any]:
         body: dict[str, Any] = {"code": code}

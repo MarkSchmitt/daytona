@@ -243,8 +243,12 @@ jobs:
           }
 
           OK=true
-          wait_snapshot "daytonaio/sandbox:0.6.0-slim" "daytonaio%2Fsandbox%3A0.6.0-slim" || OK=false
-          wait_snapshot "python-default" "python-default" || OK=false
+          wait_snapshot "daytonaio/sandbox:0.6.0-slim" "daytonaio%2Fsandbox%3A0.6.0-slim" &
+          pid_sandbox=$!
+          wait_snapshot "python-default" "python-default" &
+          pid_python=$!
+          wait "$pid_sandbox" || OK=false
+          wait "$pid_python" || OK=false
 
           if [ "$OK" = true ]; then
             exit 0

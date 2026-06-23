@@ -66,14 +66,38 @@ func TestSessionScaleOut(t *testing.T) {
 	// timeout (which would otherwise trip — same failure class as TestGitClone).
 	client := &http.Client{Timeout: 5 * time.Minute}
 
-	// Best-effort cleanup: remove the session sandboxes this run produced so an
-	// on-demand invocation doesn't leak warm sandboxes. The pool's reconcile
-	// cron rolls the now-stale SessionInstance rows.
+	// Sandbox IDs this run actually touched. The container hostname printed by
+	// the executed code equals the sandbox Id (runner sets container Hostname =
+	// sandbox Id, see apps/runner/pkg/docker/container_configs.go), so the set of
+	// observed hostnames is exactly the set of sandboxes this run used. Guarded
+	// because the burst populates it from concurrent goroutines.
+	var ownedMu sync.Mutex
+	owned := map[string]struct{}{}
+	recordOwned := func(hostname string) {
+		if hostname == "" {
+			return
+		}
+		ownedMu.Lock()
+		owned[hostname] = struct{}{}
+		ownedMu.Unlock()
+	}
+
+	// Best-effort cleanup: remove ONLY the session sandboxes this run produced so
+	// an on-demand invocation doesn't leak warm sandboxes — without touching
+	// unrelated warm-pool / other-run sandboxes that share the template label.
+	// The pool's reconcile cron rolls the now-stale SessionInstance rows.
 	t.Cleanup(func() {
+		ownedMu.Lock()
+		defer ownedMu.Unlock()
 		for _, item := range scaleoutListSessionSandboxes(t, api, template) {
-			if id, ok := item["id"].(string); ok && id != "" {
-				api.DeleteSandbox(t, id)
+			id, ok := item["id"].(string)
+			if !ok || id == "" {
+				continue
 			}
+			if _, mine := owned[id]; !mine {
+				continue
+			}
+			api.DeleteSandbox(t, id)
 		}
 	})
 
@@ -86,11 +110,13 @@ func TestSessionScaleOut(t *testing.T) {
 	var warmBody map[string]interface{}
 	warmOK := false
 	for attempt := 1; attempt <= 6; attempt++ {
-		status, body, err := scaleoutCodeRun(client, cfg, "import socket; print(socket.gethostname())")
+		status, body, err := scaleoutCodeRun(client, cfg, template, "import socket; print(socket.gethostname())")
 		warmBody = body
 		if err == nil && status == http.StatusOK {
 			warmOK = true
-			t.Logf("warm-up succeeded on attempt %d; sandbox hostname=%q", attempt, strings.TrimSpace(scaleoutStdout(body)))
+			warmHost := strings.TrimSpace(scaleoutStdout(body))
+			recordOwned(warmHost)
+			t.Logf("warm-up succeeded on attempt %d; sandbox hostname=%q", attempt, warmHost)
 			break
 		}
 		t.Logf("warm-up attempt %d/6: status=%d err=%v (body=%v)", attempt, status, err, body)
@@ -116,10 +142,12 @@ func TestSessionScaleOut(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			<-barrier
-			status, body, err := scaleoutCodeRun(client, cfg, code)
+			status, body, err := scaleoutCodeRun(client, cfg, template, code)
+			hostname := strings.TrimSpace(scaleoutStdout(body))
+			recordOwned(hostname)
 			results[idx] = opResult{
 				status:   status,
-				hostname: strings.TrimSpace(scaleoutStdout(body)),
+				hostname: hostname,
 				body:     body,
 				err:      err,
 			}
@@ -192,11 +220,19 @@ func TestSessionScaleOut(t *testing.T) {
 	}
 }
 
-// scaleoutCodeRun POSTs a one-shot code-run using the supplied long-timeout
-// client (the shared APIClient's 30s timeout is too short for the provision-on-
-// demand path). Returns the HTTP status, parsed body, and any transport error.
-func scaleoutCodeRun(client *http.Client, cfg Config, code string) (int, map[string]interface{}, error) {
-	payload, err := json.Marshal(map[string]interface{}{"language": "python", "code": code})
+// scaleoutCodeRun POSTs a one-shot code-run for the given template using the
+// supplied long-timeout client (the shared APIClient's 30s timeout is too short
+// for the provision-on-demand path). Returns the HTTP status, parsed body, and
+// any transport error.
+func scaleoutCodeRun(client *http.Client, cfg Config, template, code string) (int, map[string]interface{}, error) {
+	// Always pin the burst to the SAME template the test asserts/cleans against;
+	// omitting it makes the API fall back to its default (python-default), which
+	// would diverge from SESSION_SCALEOUT_TEMPLATE overrides.
+	reqBody := map[string]interface{}{"language": "python", "code": code}
+	if template != "" {
+		reqBody["template"] = template
+	}
+	payload, err := json.Marshal(reqBody)
 	if err != nil {
 		return 0, nil, err
 	}

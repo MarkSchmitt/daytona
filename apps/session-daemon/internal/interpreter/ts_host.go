@@ -78,9 +78,34 @@ func (f *TSFactory) Create(ctxID string, req CreateSessionRequest, onChunk func(
 	}
 
 	host.register(ctxID, onChunk)
+
+	// Await the host's create acknowledgment so a host-side create failure
+	// (ContextExistsError/HostError from repl_host.js) surfaces as an error
+	// here instead of returning a live-but-broken worker. The host replies with
+	// either a "created" control chunk or an error chunk carrying the sessionId.
+	ack := make(chan *WorkerChunk, 1)
+	host.registerCreate(ctxID, ack)
+	defer host.unregisterCreate(ctxID)
+
 	if err := host.send(WorkerCommand{Op: "create", SessionID: ctxID, MemoryLimitMB: memMB}); err != nil {
 		host.unregister(ctxID)
 		return nil, err
+	}
+
+	t := time.NewTimer(createAckTimeout)
+	defer t.Stop()
+	select {
+	case chunk := <-ack:
+		if chunk.Type == ChunkTypeError {
+			host.unregister(ctxID)
+			return nil, fmt.Errorf("ts host create failed: %s: %s", chunk.Name, chunk.Value)
+		}
+	case <-host.done:
+		host.unregister(ctxID)
+		return nil, errors.New("ts host: exited before create acknowledgment")
+	case <-t.C:
+		host.unregister(ctxID)
+		return nil, errors.New("ts host: create acknowledgment timeout")
 	}
 
 	w := &tsHostWorker{ctxID: ctxID, host: host}
@@ -180,14 +205,15 @@ func (f *TSFactory) ensureHost() (*tsHost, error) {
 	}
 
 	host := &tsHost{
-		factory:   f,
-		cmd:       cmd,
-		stdin:     stdin,
-		stdout:    stdout,
-		cancel:    cancel,
-		done:      make(chan struct{}),
-		logger:    f.logger.With(slog.String("component", "ts_host"), slog.Int("pid", cmd.Process.Pid)),
-		listeners: make(map[string]func(*WorkerChunk)),
+		factory:        f,
+		cmd:            cmd,
+		stdin:          stdin,
+		stdout:         stdout,
+		cancel:         cancel,
+		done:           make(chan struct{}),
+		logger:         f.logger.With(slog.String("component", "ts_host"), slog.Int("pid", cmd.Process.Pid)),
+		listeners:      make(map[string]func(*WorkerChunk)),
+		pendingCreates: make(map[string]chan *WorkerChunk),
 	}
 	host.active.Store(true)
 
@@ -213,7 +239,11 @@ type tsHost struct {
 
 	mu        sync.Mutex
 	listeners map[string]func(*WorkerChunk)
-	active    activeFlag
+	// pendingCreates routes the host's create acknowledgment (a "created" control
+	// chunk or a ContextExistsError/HostError) back to the in-flight Create call,
+	// keyed by sessionId. Guarded by mu.
+	pendingCreates map[string]chan *WorkerChunk
+	active         activeFlag
 }
 
 func (h *tsHost) register(ctxID string, onChunk func(*WorkerChunk)) {
@@ -226,6 +256,35 @@ func (h *tsHost) unregister(ctxID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.listeners, ctxID)
+}
+
+func (h *tsHost) registerCreate(ctxID string, ch chan *WorkerChunk) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.pendingCreates[ctxID] = ch
+}
+
+func (h *tsHost) unregisterCreate(ctxID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.pendingCreates, ctxID)
+}
+
+// deliverCreate routes a create acknowledgment chunk to a waiting Create call.
+// Returns true when the chunk was consumed as an ack (and must not be dispatched
+// to the per-context listener).
+func (h *tsHost) deliverCreate(chunk *WorkerChunk) bool {
+	h.mu.Lock()
+	ch := h.pendingCreates[chunk.SessionID]
+	h.mu.Unlock()
+	if ch == nil {
+		return false
+	}
+	select {
+	case ch <- chunk:
+	default:
+	}
+	return true
 }
 
 func (h *tsHost) send(cmd WorkerCommand) error {
@@ -298,6 +357,14 @@ func (h *tsHost) readLoop() {
 			}
 			continue
 		}
+		// Create acknowledgment ("created" control or a create-time error) is routed
+		// back to the in-flight Create call rather than to the per-context listener.
+		if chunk.SessionID != "" &&
+			((chunk.Type == ChunkTypeControl && chunk.Text == "created") || chunk.Type == ChunkTypeError) {
+			if h.deliverCreate(&chunk) {
+				continue
+			}
+		}
 		// Lifecycle control chunks ("created"/"deleted"/"interrupted"/"host-ready") are
 		// not user-visible; only "completed" must reach the per-context handler.
 		if chunk.Type == ChunkTypeControl && chunk.Text != ControlChunkTypeCompleted &&
@@ -327,6 +394,38 @@ func (h *tsHost) waitLoop() {
 	close(h.done)
 	if err != nil {
 		h.logger.Warn("ts host exited", slog.String("error", err.Error()))
+	}
+
+	// The host is gone, so any in-flight exec waiting on a "completed" control
+	// chunk would block forever. Mirror the python worker's waitLoop: synthesize
+	// a WorkerProcessError + completed pair for every registered listener so the
+	// waiter in session.go unblocks. Snapshot under the lock to avoid racing with
+	// (un)register, then dispatch without holding it.
+	msg := "ts host exited"
+	if err != nil {
+		msg = "ts host exited: " + err.Error()
+	}
+	h.mu.Lock()
+	listeners := make(map[string]func(*WorkerChunk), len(h.listeners))
+	for id, fn := range h.listeners {
+		listeners[id] = fn
+	}
+	h.mu.Unlock()
+	for id, fn := range listeners {
+		if fn == nil {
+			continue
+		}
+		fn(&WorkerChunk{
+			SessionID: id,
+			Type:      ChunkTypeError,
+			Name:      "WorkerProcessError",
+			Value:     msg,
+		})
+		fn(&WorkerChunk{
+			SessionID: id,
+			Type:      ChunkTypeControl,
+			Text:      ControlChunkTypeCompleted,
+		})
 	}
 }
 

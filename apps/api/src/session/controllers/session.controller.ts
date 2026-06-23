@@ -121,7 +121,9 @@ export class SessionController {
   @ApiResponse({ status: 200, type: SessionAccessDto })
   async getSessionAccess(
     @IsOrganizationAuthContext() ctx: OrganizationAuthContext,
-    @Param('id', ParseUUIDPipe) id: string,
+    // Plain string (no ParseUUIDPipe): transient/invalid ids are valid handles here and must
+    // reach the service to surface a proper 404/410, not be rejected up front with a 400.
+    @Param('id') id: string,
   ): Promise<SessionAccessDto> {
     return this.session.getSessionAccess(ctx.organizationId, id)
   }

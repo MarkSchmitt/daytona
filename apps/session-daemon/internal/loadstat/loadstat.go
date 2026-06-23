@@ -107,20 +107,31 @@ func (c *Collector) read(rel string) (string, bool) {
 
 func (c *Collector) cpuV2(now time.Time) *CPU {
 	out := &CPU{}
+	// Track whether ANY real CPU signal was obtained (PSI or usage). A valid PSI
+	// of 0 is a real reading, so we must not infer "missing" from the value being
+	// zero — only from the parse failing. Return nil only when nothing was
+	// readable, matching the graceful-degradation contract of cpuV1/memV1/etc.
+	got := false
 	if raw, ok := c.read("cpu.pressure"); ok {
 		if v, ok := ParsePSISomeAvg10(raw); ok {
 			out.PressureSomeAvg10 = v
+			got = true
 		}
 	}
 	statRaw, ok := c.read("cpu.stat")
 	if !ok {
-		if out.PressureSomeAvg10 == 0 {
+		if !got {
 			return nil
 		}
 		return out
 	}
 	usage, ok := ParseCPUUsageUsec(statRaw)
 	if !ok {
+		// cpu.stat readable but malformed: fall back to whatever PSI we got, or
+		// nil if we got nothing at all (don't return an empty &CPU{}).
+		if !got {
+			return nil
+		}
 		return out
 	}
 	quota := 0.0

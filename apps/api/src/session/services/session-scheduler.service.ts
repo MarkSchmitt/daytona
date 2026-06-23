@@ -38,6 +38,9 @@ export class SessionScheduler {
 
     for (const inst of await this.byAscendingLoad(instances)) {
       const n = await this.load.incrInflight(inst.id)
+      // A failed increment (Redis down) returns a negative sentinel — fail closed: don't treat it
+      // as a free slot, and don't decrement (nothing was incremented). Try the next instance.
+      if (n < 0) continue
       const snap = await this.load.getSnapshot(inst.id)
       const effective = Math.max(n, snap?.busyContexts ?? 0)
       if (effective <= target && !this.load.isResourceSaturated(snap)) {

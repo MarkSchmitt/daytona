@@ -76,7 +76,12 @@ export class SessionLoadService implements OnModuleInit, OnModuleDestroy {
 
   // -- in-flight counters --------------------------------------------------
 
-  /** Optimistically mark one more in-flight op on an instance; returns the new count. */
+  /**
+   * Optimistically mark one more in-flight op on an instance; returns the new (monotonic) count.
+   * Returns -1 (a sentinel below any valid post-incr count, which is always >= 1) when Redis is
+   * unavailable, so the scheduler fails *closed* — a failed increment must never be interpreted as
+   * a successful admission (effective load <= target).
+   */
   async incrInflight(instanceId: string): Promise<number> {
     const ttl = this.config.get('session.scale.loadTtlSeconds') ?? 30
     try {
@@ -85,7 +90,7 @@ export class SessionLoadService implements OnModuleInit, OnModuleDestroy {
       return n
     } catch (err) {
       this.logger.debug(`incrInflight(${instanceId}) failed: ${err.message}`)
-      return 0
+      return -1
     }
   }
 
@@ -110,9 +115,15 @@ export class SessionLoadService implements OnModuleInit, OnModuleDestroy {
    */
   async checkoutSlot(instanceId: string, language: string, maxSlots: number): Promise<number> {
     const key = `session:slots:${instanceId}:${language}`
-    const ttl = this.config.get('session.scale.loadTtlSeconds') ?? 30
+    // The slot key must outlive the longest possible exec — a slot that expires mid-exec could be
+    // re-handed-out and collide two ops on one daemon context. Use the larger of the load TTL and
+    // the max exec timeout (plus the same +5s margin runOnDaemon applies to its socket deadline).
+    const loadTtl = this.config.get('session.scale.loadTtlSeconds') ?? 30
+    const execTtl = (this.config.get('session.execTimeoutSeconds') ?? 600) + 5
+    const ttl = Math.max(loadTtl, execTtl)
     try {
-      for (let slot = 0; slot < Math.max(1, maxSlots); slot++) {
+      // [0, maxSlots): when maxSlots === 0 no slot is allocated (caller uses an ephemeral context).
+      for (let slot = 0; slot < maxSlots; slot++) {
         const added = await this.redis.sadd(key, String(slot))
         if (added === 1) {
           await this.redis.expire(key, ttl)

@@ -337,17 +337,19 @@ export class Daytona implements AsyncDisposable {
     // produces an SessionsApi the service will switch to it without an SDK API change.
     // We give it a child axios instance with the API baseURL + auth headers baked in,
     // since unlike the generated APIs it doesn't take a Configuration param at every call.
-    const sessionAxios = axios.create({
-      baseURL: this.apiUrl,
-      timeout: 5 * 60 * 1000,
-      headers: {
-        Authorization: `Bearer ${this.apiKey || this.jwtToken}`,
-        'X-Daytona-Source': sdkLabel,
-        'X-Daytona-SDK-Version': packageJson.version,
-        'User-Agent': `${sdkLabel}/${packageJson.version}`,
-        ...orgHeader,
-      },
-    })
+    const sessionAxios = Daytona.attachAxiosInterceptors(
+      axios.create({
+        baseURL: this.apiUrl,
+        timeout: 5 * 60 * 1000,
+        headers: {
+          Authorization: `Bearer ${this.apiKey || this.jwtToken}`,
+          'X-Daytona-Source': sdkLabel,
+          'X-Daytona-SDK-Version': packageJson.version,
+          'User-Agent': `${sdkLabel}/${packageJson.version}`,
+          ...orgHeader,
+        },
+      }),
+    )
     this.session = new SessionService(sessionAxios)
     this.clientConfig = configuration
 
@@ -851,6 +853,18 @@ export class Daytona implements AsyncDisposable {
       timeout: 24 * 60 * 60 * 1000, // 24 hours
     })
 
+    return Daytona.attachAxiosInterceptors(axiosInstance)
+  }
+
+  /**
+   * Attaches the shared Daytona interceptors (W3C trace propagation, error
+   * normalization via createAxiosDaytonaError, and span metrics) to an existing
+   * axios instance. Used by both createAxiosInstance() and the SessionService's
+   * pre-configured axios client so every SDK HTTP call gets identical handling.
+   *
+   * @hidden
+   */
+  public static attachAxiosInterceptors(axiosInstance: AxiosInstance): AxiosInstance {
     // Request interceptor: Inject trace context into headers
     axiosInstance.interceptors.request.use(
       (requestConfig: InternalAxiosRequestConfig) => {

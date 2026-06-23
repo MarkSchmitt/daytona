@@ -351,22 +351,31 @@ func (w *pythonSubprocessWorker) Shutdown() {
 }
 
 func (w *pythonSubprocessWorker) readLoop() {
-	scanner := bufio.NewScanner(w.stdout)
-	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		var chunk WorkerChunk
-		if err := json.Unmarshal(line, &chunk); err != nil {
-			w.logger.Warn("ignoring malformed worker chunk", slog.String("error", err.Error()))
-			continue
+	// Frames are newline-delimited JSON. A single legitimate frame (e.g. a large
+	// base64 image payload from matplotlib) can exceed any fixed scanner cap, and
+	// bufio.Scanner returns ErrTooLong and silently kills the loop in that case —
+	// dropping the worker. Use a bufio.Reader with a large initial buffer and
+	// ReadString('\n'), which grows as needed and never hard-fails on long lines.
+	reader := bufio.NewReaderSize(w.stdout, 64*1024)
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			var chunk WorkerChunk
+			if jerr := json.Unmarshal([]byte(line), &chunk); jerr != nil {
+				w.logger.Warn("ignoring malformed worker chunk", slog.String("error", jerr.Error()))
+			} else {
+				chunk.SessionID = w.ctxID
+				if w.onChunk != nil {
+					w.onChunk(&chunk)
+				}
+			}
 		}
-		chunk.SessionID = w.ctxID
-		if w.onChunk != nil {
-			w.onChunk(&chunk)
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				w.logger.Debug("worker readLoop ended", slog.String("error", err.Error()))
+			}
+			return
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		w.logger.Debug("worker readLoop ended", slog.String("error", err.Error()))
 	}
 }
 

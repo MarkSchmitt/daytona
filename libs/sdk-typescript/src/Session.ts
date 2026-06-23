@@ -7,6 +7,34 @@ import axios, { AxiosInstance } from 'axios'
 import { DaytonaError } from './errors/DaytonaError'
 
 /**
+ * HTTP status of an error, whether it's a raw AxiosError or a DaytonaError
+ * already normalized by the shared axios interceptors.
+ */
+function errorStatus(err: unknown): number | undefined {
+  if (axios.isAxiosError(err)) {
+    return err.response?.status
+  }
+  if (err instanceof DaytonaError) {
+    return err.statusCode
+  }
+  return undefined
+}
+
+/**
+ * Raw response body of an error, from a raw AxiosError or a normalized
+ * DaytonaError (which preserves the body on `.data`).
+ */
+function errorBody(err: unknown): unknown {
+  if (axios.isAxiosError(err)) {
+    return err.response?.data
+  }
+  if (err instanceof DaytonaError) {
+    return err.data
+  }
+  return undefined
+}
+
+/**
  * One frame on the streaming WS protocol. Mirrors the daemon-side frame format 1:1.
  */
 export type SessionFrameType = 'stdout' | 'stderr' | 'error' | 'display' | 'control'
@@ -176,32 +204,48 @@ export class SessionService {
   }
 
   async listSessions(template?: string): Promise<SessionRef[]> {
-    const { data } = await this.http.get<SessionRef[]>('/sessions', {
-      params: template ? { template } : undefined,
-    })
-    return data
+    try {
+      const { data } = await this.http.get<SessionRef[]>('/sessions', {
+        params: template ? { template } : undefined,
+      })
+      return data
+    } catch (err) {
+      throw this.translateError(err)
+    }
   }
 
   async deleteSession(id: string): Promise<void> {
-    await this.http.delete(`/sessions/${encodeURIComponent(id)}`)
-    this.ctxAccess.delete(id)
+    try {
+      await this.http.delete(`/sessions/${encodeURIComponent(id)}`)
+      this.ctxAccess.delete(id)
+    } catch (err) {
+      throw this.translateError(err)
+    }
   }
 
   async listTemplates(): Promise<
     Array<{ name: string; description?: string; languages: string[]; packages?: string[] }>
   > {
-    const { data } = await this.http.get('/sessions/templates')
-    return data
+    try {
+      const { data } = await this.http.get('/sessions/templates')
+      return data
+    } catch (err) {
+      throw this.translateError(err)
+    }
   }
 
   async listPackages(
     templateName: string,
     language: string,
   ): Promise<Array<{ name: string; version: string; hasNativeBindings?: boolean }>> {
-    const { data } = await this.http.get(`/sessions/templates/${encodeURIComponent(templateName)}/packages`, {
-      params: { language },
-    })
-    return data
+    try {
+      const { data } = await this.http.get(`/sessions/templates/${encodeURIComponent(templateName)}/packages`, {
+        params: { language },
+      })
+      return data
+    } catch (err) {
+      throw this.translateError(err)
+    }
   }
 
   // -- direct-to-sandbox hot path ----------------------------------------
@@ -323,6 +367,10 @@ export class SessionService {
       }
 
       const onAbort = () => finish(new DaytonaError('runStream aborted by caller'))
+      if (handlers?.signal?.aborted) {
+        finish(new DaytonaError('runStream aborted by caller'))
+        return
+      }
       handlers?.signal?.addEventListener('abort', onAbort, { once: true })
 
       ws.onopen = () => {
@@ -382,17 +430,15 @@ export class SessionService {
       const { data } = await this.http.get<SessionAccess>(`/sessions/${encodeURIComponent(sessionId)}/access`)
       return data
     } catch (err) {
-      if (axios.isAxiosError(err)) {
-        const status = err.response?.status
-        if (status === 404) {
-          if (this.isRouteMissing404(err.response?.data)) {
-            throw new LegacyFallback()
-          }
-          throw new SessionInvalidatedError(sessionId, new Date().toISOString())
+      const status = errorStatus(err)
+      if (status === 404) {
+        if (this.isRouteMissing404(errorBody(err))) {
+          throw new LegacyFallback()
         }
-        if (status === 410) {
-          throw this.translateError(err)
-        }
+        throw new SessionInvalidatedError(sessionId, new Date().toISOString())
+      }
+      if (status === 410) {
+        throw this.translateError(err)
       }
       throw err
     }
@@ -412,11 +458,11 @@ export class SessionService {
       }
       return { sessionId: data.id, access: data.access }
     } catch (err) {
-      if (axios.isAxiosError(err) && err.response?.status === 404 && this.isRouteMissing404(err.response.data)) {
-        throw new LegacyFallback()
-      }
       if (err instanceof LegacyFallback) {
         throw err
+      }
+      if (errorStatus(err) === 404 && this.isRouteMissing404(errorBody(err))) {
+        throw new LegacyFallback()
       }
       throw err
     }
@@ -451,10 +497,15 @@ export class SessionService {
     options: SessionRunOptions,
     handlers: Handlers,
   ): Promise<SessionRunResult> {
-    const { data } = await this.http.post<{ wsUrl: string; token: string; sessionId: string; expiresAt: string }>(
-      '/sessions/connect',
-      options,
-    )
+    let data: { wsUrl: string; token: string; sessionId: string; expiresAt: string }
+    try {
+      ;({ data } = await this.http.post<{ wsUrl: string; token: string; sessionId: string; expiresAt: string }>(
+        '/sessions/connect',
+        options,
+      ))
+    } catch (err) {
+      throw this.translateError(err)
+    }
     const WebSocketImpl = await this.resolveWebSocketImpl()
     return new Promise<SessionRunResult>((resolve, reject) => {
       const ws = new WebSocketImpl(data.wsUrl)
@@ -486,6 +537,10 @@ export class SessionService {
       }
 
       const onAbort = () => finish(new DaytonaError('runStream aborted by caller'))
+      if (handlers.signal?.aborted) {
+        finish(new DaytonaError('runStream aborted by caller'))
+        return
+      }
       handlers.signal?.addEventListener('abort', onAbort, { once: true })
 
       ws.onopen = () => {
@@ -522,15 +577,18 @@ export class SessionService {
   }
 
   private isRouteMissing404(body: unknown): boolean {
+    // A non-JSON / empty body means we never reached the route layer — treat as route-missing.
     if (!body || typeof body !== 'object') return true
     const b = body as { message?: unknown; error?: unknown }
-    if (typeof b.message === 'string' && (b.message.startsWith('Cannot ') || b.message === 'Not Found')) {
-      return true
+    // Nest's unknown-route 404 carries `message:"Cannot GET /..."`. A genuine
+    // missing-session NotFoundException carries the SAME `error:"Not Found"` but
+    // a descriptive message (e.g. "Session <id> not found."), so we must NOT
+    // key off `error` — only the message (or its absence) is a reliable signal.
+    if (typeof b.message === 'string') {
+      return b.message.startsWith('Cannot ') || b.message.trim() === ''
     }
-    if (typeof b.error === 'string' && b.error === 'Not Found') {
-      return true
-    }
-    return false
+    // No message field at all → not a recognizable missing-session envelope; assume route-missing.
+    return b.message === undefined || b.message === null
   }
 
   private applyFrame(frame: DaemonFrame, aggregated: SessionRunResult, handlers: Handlers | undefined): void {
@@ -573,8 +631,8 @@ export class SessionService {
   }
 
   private translateError(err: unknown): Error {
-    if (axios.isAxiosError(err) && err.response?.status === 410) {
-      const body = err.response.data as {
+    if (errorStatus(err) === 410) {
+      const body = errorBody(err) as {
         error?: {
           name?: string
           sessionId?: string

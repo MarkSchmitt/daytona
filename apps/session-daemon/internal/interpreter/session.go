@@ -39,9 +39,13 @@ func (c *Session) Enqueue(code string, envs map[string]string, timeout time.Dura
 	doneCh := make(chan execResult, 1)
 	job := execJob{code: code, envs: envs, timeout: timeout, reset: reset, doneCh: doneCh}
 
+	// Reserve before the send so a concurrent idle sweep observes the work and
+	// will not delete this context out from under the job.
+	c.inflight.Add(1)
 	select {
 	case c.queue <- job:
 	case <-c.queueCtx.Done():
+		c.inflight.Add(-1)
 		doneCh <- execResult{Err: fmt.Errorf("context shutting down")}
 	}
 	return doneCh
@@ -60,6 +64,7 @@ func (c *Session) processQueue() {
 			if job.doneCh != nil {
 				job.doneCh <- execResult{cmd: result, Err: err}
 			}
+			c.inflight.Add(-1)
 		}
 	}
 }
@@ -67,6 +72,12 @@ func (c *Session) processQueue() {
 // IsBusy reports whether the context currently has an exec in flight. Used by the
 // manager's /load aggregation.
 func (c *Session) IsBusy() bool { return c.busy.Load() > 0 }
+
+// hasInflightWork reports whether the context has any exec queued or running. Unlike
+// IsBusy (which only reflects an exec actively executing), this also counts jobs
+// accepted by Enqueue but not yet picked up by the queue goroutine — used by the idle
+// sweeper so it never deletes a context with accepted-but-unstarted work.
+func (c *Session) hasInflightWork() bool { return c.inflight.Load() > 0 }
 
 // runJob is the per-execution sequence: tag the active command, send the worker
 // the exec frame, await the terminal control chunk (or a timeout), then return.
@@ -268,7 +279,7 @@ func (c *Session) shutdown() {
 	}
 	if queue != nil {
 		// Drain pending jobs so their callers get an error rather than blocking forever.
-		go drainAndClose(queue)
+		go c.drainAndClose(queue)
 	}
 	if worker != nil {
 		worker.Shutdown()
@@ -278,7 +289,7 @@ func (c *Session) shutdown() {
 	}
 }
 
-func drainAndClose(q chan execJob) {
+func (c *Session) drainAndClose(q chan execJob) {
 	for {
 		select {
 		case job, ok := <-q:
@@ -288,6 +299,7 @@ func drainAndClose(q chan execJob) {
 			if job.doneCh != nil {
 				job.doneCh <- execResult{Err: fmt.Errorf("context shutdown")}
 			}
+			c.inflight.Add(-1)
 		default:
 			return
 		}

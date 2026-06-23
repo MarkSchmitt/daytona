@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: AGPL-3.0
  */
 
+import { randomUUID } from 'crypto'
 import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { Cron, CronExpression } from '@nestjs/schedule'
 import { InjectRepository } from '@nestjs/typeorm'
@@ -13,12 +14,13 @@ import { SessionInstanceState } from '../enums/session-instance-state.enum'
 import { SessionInstanceRole } from '../enums/session-instance-role.enum'
 import { SandboxService } from '../../sandbox/services/sandbox.service'
 import { Organization } from '../../organization/entities/organization.entity'
-import { RedisLockProvider } from '../../sandbox/common/redis-lock.provider'
+import { LockCode, RedisLockProvider } from '../../sandbox/common/redis-lock.provider'
 import { TypedConfigService } from '../../config/typed-config.service'
 import { SessionRepository } from './session-repository.service'
 import { SessionLoadService } from './session-load.service'
 import { SessionScheduler } from './session-scheduler.service'
 import { SandboxState } from '../../sandbox/enums/sandbox-state.enum'
+import { SandboxDesiredState } from '../../sandbox/enums/sandbox-desired-state.enum'
 import { Sandbox } from '../../sandbox/entities/sandbox.entity'
 
 const POOL_LOCK_TTL_SEC = 120
@@ -135,15 +137,20 @@ export class SessionPoolService {
   }
 
   /**
-   * Reserve a new instance row under a short per-(org,template) lock: the lock only guards the
-   * count + insert (fast), so concurrent scale-ups can each reserve a distinct slot up to the cap
-   * while the slow sandbox provisioning happens lock-free.
+   * Reserve a new instance row under a short per-(org,template) lock: the lock guards the
+   * count + insert (fast), and the PROVISIONING row is *persisted while the lock is held* so the
+   * next lock holder counts it before this one releases — concurrent scale-ups can each reserve a
+   * distinct slot up to the cap, but can never collectively exceed it. The slow sandbox
+   * provisioning then happens lock-free in provisionReserved.
    */
   private async tryReserveInstance(orgId: string, templateId: string): Promise<SessionInstance | null> {
     const max = this.config.get('session.scale.maxInstancesPerTemplate') ?? 5
     const minWarm = this.config.get('session.scale.minWarm') ?? 1
     const lockKey = `session:scale:${orgId}:${templateId}`
-    if (!(await this.lockProvider.lock(lockKey, POOL_LOCK_TTL_SEC))) return null
+    // Ownership-aware lock: a unique token per acquisition so a lock that expired (TTL) and was
+    // re-acquired by another scale-up is never deleted by this caller's unlock.
+    const lockCode = new LockCode(randomUUID())
+    if (!(await this.lockProvider.lock(lockKey, POOL_LOCK_TTL_SEC, lockCode))) return null
     try {
       const active =
         (await this.countByState(orgId, templateId, SessionInstanceState.READY)) +
@@ -157,15 +164,17 @@ export class SessionPoolService {
         state: SessionInstanceState.PROVISIONING,
         role,
       })
-      return row
+      // Persist before releasing the lock so the PROVISIONING row is counted by the next holder.
+      return await this.instanceRepo.save(row)
     } finally {
-      await this.lockProvider.unlock(lockKey).catch(() => undefined)
+      await this.lockProvider.unlock(lockKey, lockCode).catch(() => undefined)
     }
   }
 
   /**
-   * Provision the sandbox for a reserved instance row and wait until it is READY. Persists the
-   * row (with snapshotId + sandboxId) so concurrent acquirers can see it as PROVISIONING.
+   * Provision the sandbox for a reserved (already-persisted PROVISIONING) instance row and wait
+   * until it is READY. Updates the row in place (snapshotId + sandboxId); on failure marks it ERROR
+   * so reconcile's pruneErroredInstances reaps it.
    */
   private async provisionReserved(
     reserved: SessionInstance,
@@ -322,14 +331,8 @@ export class SessionPoolService {
 
   private async reapInstance(inst: SessionInstance): Promise<void> {
     this.logger.log(`scaling in idle overflow SessionInstance ${inst.id} (sandbox ${inst.sandboxId})`)
+    // rollInstance destroys the underlying sandbox when it still exists (see destroySandbox flag).
     await this.rollInstance(inst, 'scaled in (idle overflow)')
-    if (inst.sandboxId) {
-      try {
-        await this.sandboxService.destroy(inst.sandboxId, inst.organizationId)
-      } catch (err) {
-        this.logger.warn(`scale-in destroy of sandbox ${inst.sandboxId} failed: ${err.message}`)
-      }
-    }
   }
 
   /** Delete ERROR instance rows (and their already-invalid sessions) after a grace period. */
@@ -366,6 +369,28 @@ export class SessionPoolService {
     inst.errorReason = reason
     await this.instanceRepo.save(inst)
     await this.sessions.markInstanceSessionsInvalid(inst.id)
+    // Destroy the underlying sandbox so a rolled instance can't orphan it (pruneErroredInstances
+    // only deletes the DB row). Guard on the sandbox row still existing and not already being
+    // destroyed, so we don't double-destroy when the sandbox is already dead/gone.
+    await this.destroyInstanceSandbox(inst)
+  }
+
+  /**
+   * Best-effort destroy of an instance's sandbox, only when it still exists and isn't already
+   * (being) destroyed — so the dead/missing-sandbox roll paths don't double-destroy.
+   */
+  private async destroyInstanceSandbox(inst: SessionInstance): Promise<void> {
+    if (!inst.sandboxId) return
+    try {
+      const sandbox = await this.sandboxRepo.findOne({ where: { id: inst.sandboxId } })
+      if (!sandbox) return // already gone (missing / hard-deleted)
+      if (sandbox.state === SandboxState.DESTROYED || sandbox.desiredState === SandboxDesiredState.DESTROYED) {
+        return // already (being) destroyed
+      }
+      await this.sandboxService.destroy(inst.sandboxId, inst.organizationId)
+    } catch (err) {
+      this.logger.warn(`destroy of sandbox ${inst.sandboxId} (instance ${inst.id}) failed: ${err.message}`)
+    }
   }
 
   private async waitForReady(instanceId: string): Promise<SessionInstance> {

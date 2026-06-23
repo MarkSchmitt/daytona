@@ -134,18 +134,33 @@ class ContextRecord {
       signal.reject(e)
     }))
 
-    // setTimeout/setInterval bridges (isolated-vm doesn't ship them).
+    // setTimeout/setInterval bridges (isolated-vm doesn't ship them). The
+    // session calls these via applySync with `{ arguments: { reference: true } }`,
+    // so `cb` arrives as an ivm.Reference we can invoke with applyIgnored, and
+    // `ms` arrives as a Reference whose underlying number we copy out. Timers are
+    // unref'd so a lingering user interval can't keep the host process (or, on
+    // dispose, the isolate) alive past shutdown — clearInterval/clearTimeout and
+    // ContextRecord.dispose still clear them explicitly.
     const timers = new Map()
+    // Track timers on the instance so dispose() can clear any still-pending
+    // user timers (notably intervals) instead of leaking them across a context
+    // recycle (reset:true rebuilds the context but not the host process).
+    this._timers = timers
     let nextTimerId = 1
+    const derefMs = (ms) => {
+      try { return Number(typeof ms === 'object' && ms ? ms.copySync() : ms) || 0 } catch { return 0 }
+    }
     await jail.set('_setTimeout', new ivm.Reference((cb, ms) => {
       const id = nextTimerId++
-      const handle = setTimeout(() => { timers.delete(id); try { cb.applyIgnored(undefined, []) } catch {} }, Number(ms) || 0)
+      const handle = setTimeout(() => { timers.delete(id); try { cb.applyIgnored(undefined, []) } catch {} }, derefMs(ms))
+      if (handle && typeof handle.unref === 'function') handle.unref()
       timers.set(id, handle)
       return id
     }))
     await jail.set('_setInterval', new ivm.Reference((cb, ms) => {
       const id = nextTimerId++
-      const handle = setInterval(() => { try { cb.applyIgnored(undefined, []) } catch {} }, Number(ms) || 0)
+      const handle = setInterval(() => { try { cb.applyIgnored(undefined, []) } catch {} }, derefMs(ms))
+      if (handle && typeof handle.unref === 'function') handle.unref()
       timers.set(id, handle)
       return id
     }))
@@ -170,8 +185,8 @@ class ContextRecord {
         if (typeof v === 'string') return v;
         try { return JSON.stringify(v); } catch { return String(v); }
       }
-      const setTimeout = (cb, ms) => _setTimeout.applySync(undefined, [new (ivm).Reference(cb), ms]);
-      const setInterval = (cb, ms) => _setInterval.applySync(undefined, [new (ivm).Reference(cb), ms]);
+      const setTimeout = (cb, ms) => _setTimeout.applySync(undefined, [cb, ms], { arguments: { reference: true } });
+      const setInterval = (cb, ms) => _setInterval.applySync(undefined, [cb, ms], { arguments: { reference: true } });
       const clearTimeout = (id) => _clearTimer.applySync(undefined, [id]);
       const clearInterval = (id) => _clearTimer.applySync(undefined, [id]);
       // Minimal Headers shim — V8 sessions don't ship the Headers / Response /
@@ -218,30 +233,11 @@ class ContextRecord {
       // leaving env permanently empty.
       globalThis.env = {};
     `
-    // ivm.Reference is host-side only — we must NOT expose it to user code.
-    // The bootstrap above uses `new (ivm).Reference(cb)` from inside the session, which
-    // doesn't work; replace with a simpler bridge that wraps the callback in an external.
-    const bootstrapClean = bootstrap
-      .replace(/_setTimeout\.applySync\(undefined, \[new \(ivm\)\.Reference\(cb\), ms\]\)/g, '_setTimeoutShim(cb, ms)')
-      .replace(/_setInterval\.applySync\(undefined, \[new \(ivm\)\.Reference\(cb\), ms\]\)/g, '_setIntervalShim(cb, ms)')
-
-    await jail.set('_setTimeoutShim', new ivm.Reference((cbRefStr, ms) => {
-      // No-op default — proper timer bridging requires per-session Reference shimming.
-      // For v1 we pass the callback as a function via Reference at apply-time; the
-      // bridge is intentionally minimal and may be hardened in v1.1.
-      const id = nextTimerId++
-      const handle = setTimeout(() => {}, Number(ms) || 0)
-      timers.set(id, handle)
-      return id
-    }))
-    await jail.set('_setIntervalShim', new ivm.Reference((cbRefStr, ms) => {
-      const id = nextTimerId++
-      const handle = setInterval(() => {}, Number(ms) || 0)
-      timers.set(id, handle)
-      return id
-    }))
-
-    const compiled = await this.isolate.compileScript(bootstrapClean)
+    // The user-facing setTimeout/setInterval call the host bridges above with
+    // `{ arguments: { reference: true } }`, so the callback crosses the boundary
+    // as an ivm.Reference the bridge invokes — no `ivm` exposure to user code is
+    // needed and the callbacks actually run.
+    const compiled = await this.isolate.compileScript(bootstrap)
     await compiled.run(ctx)
 
     return ctx
@@ -427,6 +423,15 @@ class ContextRecord {
 
   async dispose() {
     this.disposed = true
+    // Clear any pending user timers so a leftover setInterval doesn't keep
+    // firing (and leaking host-side handles) after the isolate is gone.
+    if (this._timers) {
+      for (const handle of this._timers.values()) {
+        clearTimeout(handle)
+        clearInterval(handle)
+      }
+      this._timers.clear()
+    }
     // The compiled Modules are owned by the session and are torn down with it;
     // we just drop our references. Explicit module.release() is unnecessary
     // because session.dispose() reclaims everything in one shot.

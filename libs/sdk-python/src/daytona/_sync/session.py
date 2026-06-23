@@ -320,18 +320,33 @@ class SessionService:
     ) -> SessionRunResult:
         aggregated = SessionRunResult(stdout="", stderr="", error=None, displays=[], duration_ms=0)
         started_at = time.time()
+        # The daemon emits a terminal control frame ("completed"/"interrupted")
+        # to signal a clean end-of-run. A recv error / stream end BEFORE that
+        # frame is an abnormal disconnect and must surface as an error, not a
+        # silent success.
+        completed = False
+        disconnect_error: Optional[str] = None
         while True:
             try:
                 raw = ws.recv()
-            except Exception:  # noqa: BLE001 — closed mid-frame is the normal exit.
+            except Exception as exc:  # noqa: BLE001
+                if not completed:
+                    disconnect_error = f"session websocket disconnected mid-run: {exc}"
                 break
             if raw is None or raw == "":
+                # End of stream. Clean only if we already saw the terminal frame.
+                if not completed:
+                    disconnect_error = "session websocket closed before run completed"
                 break
             try:
                 frame = json.loads(raw)
             except json.JSONDecodeError:
                 continue
+            if frame.get("type") == "control" and frame.get("text") in ("completed", "interrupted"):
+                completed = True
             self._apply_frame(frame, aggregated, handlers)
+        if disconnect_error is not None and aggregated.error is None:
+            aggregated.error = SessionExecutionError(name="SessionDisconnected", value=disconnect_error)
         aggregated.duration_ms = int((time.time() - started_at) * 1000)
         return aggregated
 
@@ -524,15 +539,17 @@ class SessionService:
         if not isinstance(payload, dict):
             return True
         body_dict: dict[str, Any] = cast("dict[str, Any]", payload)
-        # Nest's default 404 wraps an object like {"message":"Cannot GET ...","error":"Not Found","statusCode":404}.
+        # Nest's unknown-route 404 wraps an object like
+        # {"message":"Cannot GET ...","error":"Not Found","statusCode":404}. A
+        # genuine missing-session NotFoundException carries the SAME
+        # error:"Not Found" but a descriptive message ("Session <id> not
+        # found."), so we must NOT key off `error` — only the message (or its
+        # absence) is a reliable route-missing signal.
         msg = body_dict.get("message")
-        if isinstance(msg, str) and msg.startswith(("Cannot ", "Not Found")):
-            return True
-        err: Any = body_dict.get("error")
-        if isinstance(err, str) and err == "Not Found":
-            return True
-        # Otherwise assume the server understood the route but the entity is gone.
-        return False
+        if isinstance(msg, str):
+            return msg.startswith("Cannot ") or msg.strip() == ""
+        # No message field at all → not a recognizable missing-session envelope.
+        return True
 
     def _build_run_body(self, code: str, options: Optional[SessionRunOptions]) -> dict[str, Any]:
         body: dict[str, Any] = {"code": code}

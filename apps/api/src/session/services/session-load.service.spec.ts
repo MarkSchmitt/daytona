@@ -25,7 +25,7 @@ class FakeRedis {
     return n
   }
   async expire(key: string, seconds: number): Promise<number> {
-    if (!this.store.has(key)) return 0
+    if (!this.store.has(key) && !this.sets.has(key)) return 0
     this.expiries.set(key, Date.now() + seconds * 1000)
     return 1
   }
@@ -115,6 +115,39 @@ describe('SessionLoadService', () => {
       expect(await svc.checkoutSlot('i1', 'python', 3)).toBe(-1) // all taken -> caller uses ephemeral ctx
       await svc.releaseSlot('i1', 'python', 1)
       expect(await svc.checkoutSlot('i1', 'python', 3)).toBe(1) // freed slot reused
+    })
+
+    it('allocates no slot when maxSlots is 0 (forces ephemeral fallback)', async () => {
+      const { svc } = newService()
+      // [0, 0) -> no iterations -> -1 so the caller uses a unique ephemeral context.
+      expect(await svc.checkoutSlot('i1', 'python', 0)).toBe(-1)
+    })
+
+    it('expires the slot set key so a long-lived slot is eventually reclaimed', async () => {
+      jest.useFakeTimers()
+      try {
+        // loadTtl is small but execTimeout drives the slot TTL (>= execTimeout + 5s margin).
+        const { svc } = newService(
+          makeConfig({ 'session.scale.loadTtlSeconds': 30, 'session.execTimeoutSeconds': 600 }),
+        )
+        expect(await svc.checkoutSlot('i1', 'python', 1)).toBe(0)
+        // Set key persists past the load TTL (would have been wrongly reclaimed before the fix).
+        jest.setSystemTime(Date.now() + 60 * 1000)
+        expect(await svc.checkoutSlot('i1', 'python', 1)).toBe(-1) // still in use
+        // ...but does expire once past the exec timeout, freeing the slot for reuse.
+        jest.setSystemTime(Date.now() + 605 * 1000)
+        expect(await svc.checkoutSlot('i1', 'python', 1)).toBe(0)
+      } finally {
+        jest.useRealTimers()
+      }
+    })
+  })
+
+  describe('incrInflight fail-closed', () => {
+    it('returns a negative sentinel when Redis is unavailable', async () => {
+      const { svc, redis } = newService()
+      jest.spyOn(redis, 'incr').mockRejectedValueOnce(new Error('redis down'))
+      expect(await svc.incrInflight('i1')).toBeLessThan(0)
     })
   })
 

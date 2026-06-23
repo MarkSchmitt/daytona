@@ -252,7 +252,15 @@ func (s *Server) handleExecute(c *gin.Context) {
 	go func() {
 		result := <-doneCh
 		if result.Err != nil {
-			cl.RequestClose(websocket.CloseInternalServerErr, result.Err.Error())
+			// Log the full internal error server-side, but send a generic reason to
+			// the client: the raw error string can leak internal detail and WS close
+			// reasons are capped at 123 bytes anyway. The CloseInternalServerErr code
+			// is preserved so the client can still tell the run failed.
+			s.logger.Warn("exec failed",
+				slog.String("session", id),
+				slog.String("err", result.Err.Error()),
+			)
+			cl.RequestClose(websocket.CloseInternalServerErr, "internal error")
 		} else {
 			cl.RequestClose(websocket.CloseNormalClosure, "completed")
 		}

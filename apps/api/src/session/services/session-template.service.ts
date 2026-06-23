@@ -24,7 +24,10 @@ export class SessionTemplateService {
   async resolve(orgId: string, name: string): Promise<SessionTemplate> {
     const candidates = await this.repo
       .createQueryBuilder('t')
-      .where('t.name = :name AND (t.general = true OR t.organizationId = :orgId)', { name, orgId })
+      .where('t.name = :name AND ((t.general = true AND t.organizationId IS NULL) OR t.organizationId = :orgId)', {
+        name,
+        orgId,
+      })
       .getMany()
 
     if (candidates.length === 0) {
@@ -38,7 +41,7 @@ export class SessionTemplateService {
   async list(orgId: string): Promise<SessionTemplateDto[]> {
     const rows = await this.repo
       .createQueryBuilder('t')
-      .where('t.general = true OR t.organizationId = :orgId', { orgId })
+      .where('(t.general = true AND t.organizationId IS NULL) OR t.organizationId = :orgId', { orgId })
       .orderBy('t.name', 'ASC')
       .getMany()
 

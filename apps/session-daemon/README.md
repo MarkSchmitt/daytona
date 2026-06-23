@@ -78,7 +78,7 @@ daytona.session.run("df = df[df.amount > 100]",         context=ctx)
 daytona.session.run("result = df.groupby('user').sum()", context=ctx)
 ```
 
-Both modes run in a **real CPython 3.12 interpreter** (or the V8 ESM module
+Both modes run in a **real CPython 3.11 interpreter** (or the V8 ESM module
 loader for TypeScript) inside a Daytona sandbox provisioned from a small,
 shared, in-cluster warm pool. The sandbox is invisible to the caller — the
 API tracks instances internally, and the SDK talks directly to the in-sandbox
@@ -222,7 +222,7 @@ instance, and the API picks a transient context to dispatch into.
               │                                                   │
               │  ┌──────────────┐    ┌──────────────────────────┐ │
               │  │   CPython    │    │  Node (esbuild +         │ │
-              │  │   3.12       │    │  isolated-vm host)       │ │
+              │  │   3.11       │    │  isolated-vm host)       │ │
               │  │   workers    │    │                          │ │
               │  └──────────────┘    └──────────────────────────┘ │
               └───────────────────────────────────────────────────┘
@@ -253,7 +253,7 @@ instance, and the API picks a transient context to dispatch into.
   container.
 
 - **Sandbox image (`daytonaio/session-runtime:python-default-*`)** — base
-  image carrying CPython 3.12, Node 20, esbuild, isolated-vm, and the
+  image carrying CPython 3.11, Node 22, esbuild, isolated-vm, and the
   curated package catalog. The `session-daemon` is the container entrypoint.
 
 - **session-daemon (`apps/session-daemon`)** — Go service inside each warm

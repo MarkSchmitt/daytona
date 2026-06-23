@@ -48,7 +48,7 @@ export class Migration1778367241001 implements MigrationInterface {
             true,
             ARRAY['python', 'typescript']::text[],
             snap_id,
-            'Default general-purpose session template — Python 3.12 + Node 20 with curated package catalogs.',
+            'Default general-purpose session template — Python 3.11 + Node 22 with curated package catalogs.',
             ARRAY['numpy', 'pandas', 'matplotlib', 'openai', 'requests', 'zod', 'lodash-es', '@anthropic-ai/sdk']::text[]
           );
         END IF;

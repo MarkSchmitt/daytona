@@ -27,6 +27,7 @@ import { CreateSessionDto } from '../dto/create-session.dto'
 import { CreateSessionTransientDto } from '../dto/create-session-transient.dto'
 import { SessionAccessDto, SessionDto } from '../dto/session.dto'
 import { SessionPackageDto } from '../dto/session-package.dto'
+import { SessionInvalidatedError } from '../errors/session-errors'
 
 /**
  * Wire shape of a single frame the in-sandbox session-daemon emits on the
@@ -91,6 +92,14 @@ export class SessionService {
       try {
         const out = await this.runOnDaemon(access, context.id, req.code, req.env, req.timeout, false)
         return { ...out, durationMs: Date.now() - start }
+      } catch (err) {
+        // A daemon handshake 404 means the daemon no longer knows this context (sandbox/daemon
+        // rolled out from under the still-live DB row). Translate to 410 SessionInvalidatedError —
+        // same signal the resolve()/transient paths emit — instead of a generic Error → HTTP 500.
+        if (this.isDaemonSessionNotFound(err)) {
+          throw new SessionInvalidatedError(context.id, instance.updatedAt ?? new Date())
+        }
+        throw err
       } finally {
         await this.load.decrInflight(instance.id)
       }
@@ -210,7 +219,7 @@ export class SessionService {
       // avoids a complex two-phase commit on a path that's not the steady-state.
       try {
         const internalAccess = await this.getDaemonAccess(instance)
-        await this.daemonCreateSession(internalAccess, ctx.id, language)
+        await this.daemonCreateSession(internalAccess, ctx.id, language, dto.cwd)
       } catch (err) {
         this.logger.warn(`daemon-side context create failed (will retry on next exec): ${err.message}`)
       }
@@ -542,8 +551,18 @@ export class SessionService {
         }
       })
 
-      ws.once('close', () => {
+      ws.once('close', (code: number, reason: Buffer) => {
         clearTimeout(timer)
+        // The daemon closes 1000 (normal) on success. A non-normal code means the daemon
+        // tore the stream down on an internal failure (gorilla CloseInternalServerErr=1011,
+        // with an error reason) or the transport dropped abnormally (1006). Resolving those
+        // as success would hand the caller partial stdout/stderr as if the run completed —
+        // reject so it surfaces as an error instead.
+        if (code !== 1000) {
+          const detail = reason?.toString().trim()
+          reject(new Error(`session daemon WS closed abnormally: ${code}${detail ? ` ${detail}` : ''}`))
+          return
+        }
         resolve({
           stdout,
           stderr,

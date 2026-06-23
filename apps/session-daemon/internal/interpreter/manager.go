@@ -212,6 +212,29 @@ func (m *Manager) DeleteSession(id string) error {
 	return nil
 }
 
+// deleteIfIdle removes a context only if it has no exec queued or running, re-checking
+// under the write lock to close the TOCTOU race with the idle sweeper: a context that
+// was idle when the sweep snapshot was taken can accept a job before deletion, and that
+// job must not be torn down. Used only by sweepIdle; explicit DeleteSession is
+// unconditional by design.
+func (m *Manager) deleteIfIdle(id string) {
+	m.mu.Lock()
+	c, ok := m.contexts[id]
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+	if c.hasInflightWork() {
+		m.mu.Unlock()
+		return
+	}
+	delete(m.contexts, id)
+	m.mu.Unlock()
+
+	c.shutdown()
+	m.logger.Debug("context deleted (idle)", slog.String("id", id))
+}
+
 // ListSessions returns a snapshot of every active context's info.
 func (m *Manager) ListSessions() []SessionInfo {
 	m.mu.RLock()
@@ -293,7 +316,7 @@ func (m *Manager) sweepIdle() {
 
 	m.mu.RLock()
 	for id, c := range m.contexts {
-		if c.snapshotInfo().LastUsedAt.Before(threshold) && !c.IsBusy() {
+		if c.snapshotInfo().LastUsedAt.Before(threshold) && !c.hasInflightWork() {
 			stale = append(stale, id)
 		}
 	}
@@ -301,6 +324,6 @@ func (m *Manager) sweepIdle() {
 
 	for _, id := range stale {
 		m.logger.Debug("sweeping idle context", slog.String("id", id))
-		_ = m.DeleteSession(id)
+		m.deleteIfIdle(id)
 	}
 }
