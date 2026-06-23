@@ -60,11 +60,18 @@ func (c *Session) processQueue() {
 			if !ok {
 				return
 			}
-			result, err := c.runJob(job)
-			if job.doneCh != nil {
-				job.doneCh <- execResult{cmd: result, Err: err}
-			}
-			c.inflight.Add(-1)
+			// Decrement via defer so a panic in runJob (or the doneCh send) still
+			// releases the inflight reservation — a leaked reservation keeps
+			// hasInflightWork() true forever and blocks idle GC of this session
+			// ([B4]). Exactly one decrement per consumed job, matching the Enqueue
+			// increment; the closure scopes the defer to this single iteration.
+			func() {
+				defer c.inflight.Add(-1)
+				result, err := c.runJob(job)
+				if job.doneCh != nil {
+					job.doneCh <- execResult{cmd: result, Err: err}
+				}
+			}()
 		}
 	}
 }

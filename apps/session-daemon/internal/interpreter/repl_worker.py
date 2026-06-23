@@ -37,6 +37,29 @@ except Exception:  # noqa: BLE001
     matplotlib = None  # type: ignore[assignment]
 
 
+# Max bytes for any single text payload written into an output frame. Capping
+# here (the emit side) means no single stdout/stderr/error/display frame can blow
+# past the reader's bounded line size on the Go side, regardless of how much the
+# user code prints in one shot. Kept in sync with MAX_CHUNK_BYTES in repl_host.js.
+MAX_CHUNK_BYTES = 1 << 20  # 1 MiB
+
+
+def _truncate_text(s: str) -> str:
+    """Cap a text payload at MAX_CHUNK_BYTES, appending an omitted-bytes marker.
+
+    Slices on a UTF-8 byte boundary so we never emit a split multibyte sequence;
+    returns the input untouched when already within budget (the common case).
+    """
+    if not isinstance(s, str):
+        return s
+    encoded = s.encode("utf-8")
+    if len(encoded) <= MAX_CHUNK_BYTES:
+        return s
+    kept = encoded[:MAX_CHUNK_BYTES].decode("utf-8", "ignore")
+    omitted = len(encoded) - len(kept.encode("utf-8"))
+    return f"{kept}…[output truncated: {omitted} bytes omitted]"
+
+
 class REPLWorker:
     def __init__(self) -> None:
         self.globals = self._fresh_globals()
@@ -58,6 +81,18 @@ class REPLWorker:
 
     # ---------- IO ----------
     def _emit(self, chunk: dict) -> None:
+        # Cap oversized text payloads (stdout/stderr/error/display) per field so
+        # no single frame can be unbounded — see MAX_CHUNK_BYTES. Applied per
+        # text-bearing field rather than to the whole JSON line so the structure
+        # stays intact and the omitted-bytes marker lands inside the field.
+        for key in ("text", "value", "traceback"):
+            if isinstance(chunk.get(key), str):
+                chunk[key] = _truncate_text(chunk[key])
+        data = chunk.get("data")
+        if isinstance(data, dict):
+            for mime, payload in data.items():
+                if isinstance(payload, str):
+                    data[mime] = _truncate_text(payload)
         try:
             json.dump(chunk, sys.__stdout__)
             sys.__stdout__.write("\n")

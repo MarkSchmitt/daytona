@@ -350,15 +350,74 @@ func (w *pythonSubprocessWorker) Shutdown() {
 	}
 }
 
+// errLineTooLong is returned by readBoundedLine when a single newline-delimited
+// frame exceeds maxWorkerLineBytes. The overrun is drained up to (and including)
+// the terminating newline so the reader resynchronizes on the next frame instead
+// of mis-parsing the tail as a fresh line.
+var errLineTooLong = errors.New("worker output line exceeds limit")
+
+// readBoundedLine reads a newline-terminated frame, capping buffered bytes at
+// maxWorkerLineBytes. On a frame at or under the cap it behaves like
+// ReadString('\n'). On an over-long frame it drains the remainder of the line
+// and returns errLineTooLong with no usable data — callers recover for the
+// affected context rather than OOMing or killing the worker.
+func readBoundedLine(reader *bufio.Reader) (string, error) {
+	var buf []byte
+	for {
+		b, err := reader.ReadByte()
+		if err != nil {
+			return string(buf), err
+		}
+		if b == '\n' {
+			return string(append(buf, b)), nil
+		}
+		if len(buf) >= maxWorkerLineBytes {
+			// Drain to the next newline (or EOF) so the next read starts on a
+			// clean frame boundary, then report the overrun.
+			for b != '\n' {
+				var derr error
+				b, derr = reader.ReadByte()
+				if derr != nil {
+					return "", errLineTooLong
+				}
+			}
+			return "", errLineTooLong
+		}
+		buf = append(buf, b)
+	}
+}
+
 func (w *pythonSubprocessWorker) readLoop() {
 	// Frames are newline-delimited JSON. A single legitimate frame (e.g. a large
 	// base64 image payload from matplotlib) can exceed any fixed scanner cap, and
 	// bufio.Scanner returns ErrTooLong and silently kills the loop in that case —
 	// dropping the worker. Use a bufio.Reader with a large initial buffer and
-	// ReadString('\n'), which grows as needed and never hard-fails on long lines.
+	// readBoundedLine, which grows as needed up to maxWorkerLineBytes so a runaway
+	// frame can't grow the buffer without bound ([B1] unbounded memory).
 	reader := bufio.NewReaderSize(w.stdout, 64*1024)
 	for {
-		line, err := reader.ReadString('\n')
+		line, err := readBoundedLine(reader)
+		if errors.Is(err, errLineTooLong) {
+			// Over-long frame: the emit-side cap (MAX_CHUNK_BYTES) makes this
+			// unreachable in practice, but if it happens, surface an error for the
+			// current exec and recover rather than OOM or silently kill the worker.
+			// The worker is per-context so the blast radius is this one context.
+			w.logger.Warn("dropping oversized worker chunk", slog.Int("limit", maxWorkerLineBytes))
+			if w.onChunk != nil {
+				w.onChunk(&WorkerChunk{
+					SessionID: w.ctxID,
+					Type:      ChunkTypeError,
+					Name:      "WorkerProcessError",
+					Value:     fmt.Sprintf("worker output frame exceeded %d bytes and was dropped", maxWorkerLineBytes),
+				})
+				w.onChunk(&WorkerChunk{
+					SessionID: w.ctxID,
+					Type:      ChunkTypeControl,
+					Text:      ControlChunkTypeCompleted,
+				})
+			}
+			continue
+		}
 		if len(line) > 0 {
 			var chunk WorkerChunk
 			if jerr := json.Unmarshal([]byte(line), &chunk); jerr != nil {

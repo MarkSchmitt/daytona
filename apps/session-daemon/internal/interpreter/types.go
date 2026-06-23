@@ -18,6 +18,13 @@ const (
 	// createAckTimeout bounds how long TSFactory.Create waits for the host's
 	// "created"/error acknowledgment so a stalled host can't hang Create forever.
 	createAckTimeout = 15 * time.Second
+	// maxWorkerLineBytes bounds a single newline-delimited worker output frame the
+	// readers will buffer. Set generously above the interpreters' emit-side cap
+	// (MAX_CHUNK_BYTES, 1 MiB) so legitimate frames never trip it, while still
+	// preventing a malformed/runaway worker from growing reader memory without
+	// bound ([B1]). An over-long line is drained and reported as an error chunk to
+	// the affected context rather than crashing the reader ([C3]).
+	maxWorkerLineBytes = 8 * 1024 * 1024
 )
 
 // WebSocket close codes (4000-4999 are for private/application use).

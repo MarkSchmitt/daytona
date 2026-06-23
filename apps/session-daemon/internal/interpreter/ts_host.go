@@ -338,53 +338,106 @@ func (a *activeFlag) Swap(v bool) bool {
 }
 
 func (h *tsHost) readLoop() {
-	scanner := bufio.NewScanner(h.stdout)
-	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
-	for scanner.Scan() {
-		line := scanner.Bytes()
+	// Bounded reader rather than bufio.Scanner: a Scanner returns ErrTooLong on a
+	// line past its cap and ENDS the loop, which — via waitLoop's host-exit
+	// propagation — would take down EVERY context sharing this host ([C3]). With
+	// readBoundedLine an over-long line is drained and reported to the AFFECTED
+	// session only, leaving the shared host and all other contexts intact. The
+	// emit-side cap (MAX_CHUNK_BYTES) makes this unreachable in practice.
+	reader := bufio.NewReaderSize(h.stdout, 64*1024)
+	for {
+		line, err := readBoundedLine(reader)
+		if errors.Is(err, errLineTooLong) {
+			h.reportOversizedLine()
+			continue
+		}
+		if len(line) == 0 {
+			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					h.logger.Debug("ts host readLoop ended", slog.String("error", err.Error()))
+				}
+				return
+			}
+			continue
+		}
 		var chunk WorkerChunk
-		if err := json.Unmarshal(line, &chunk); err != nil {
-			h.logger.Warn("malformed ts host chunk", slog.String("error", err.Error()))
-			continue
+		if jerr := json.Unmarshal([]byte(line), &chunk); jerr != nil {
+			h.logger.Warn("malformed ts host chunk", slog.String("error", jerr.Error()))
+		} else {
+			h.dispatchChunk(&chunk)
 		}
-		// Reply chunks (e.g., list-packages) are routed to the factory's reply table.
-		if chunk.Type == ChunkTypeControl && chunk.Text == "list-packages-result" {
-			h.factory.replyMu.Lock()
-			ch := h.factory.pendingReps[chunk.Reply]
-			h.factory.replyMu.Unlock()
-			if ch != nil {
-				ch <- &chunk
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				h.logger.Debug("ts host readLoop ended", slog.String("error", err.Error()))
 			}
-			continue
-		}
-		// Create acknowledgment ("created" control or a create-time error) is routed
-		// back to the in-flight Create call rather than to the per-context listener.
-		if chunk.SessionID != "" &&
-			((chunk.Type == ChunkTypeControl && chunk.Text == "created") || chunk.Type == ChunkTypeError) {
-			if h.deliverCreate(&chunk) {
-				continue
-			}
-		}
-		// Lifecycle control chunks ("created"/"deleted"/"interrupted"/"host-ready") are
-		// not user-visible; only "completed" must reach the per-context handler.
-		if chunk.Type == ChunkTypeControl && chunk.Text != ControlChunkTypeCompleted &&
-			chunk.Text != ControlChunkTypeInterrupted {
-			continue
-		}
-		// Per-context chunk → look up the listener and dispatch.
-		if chunk.SessionID == "" {
-			h.logger.Debug("dropping chunk without sessionId")
-			continue
-		}
-		h.mu.Lock()
-		listener := h.listeners[chunk.SessionID]
-		h.mu.Unlock()
-		if listener != nil {
-			listener(&chunk)
+			return
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		h.logger.Debug("ts host readLoop ended", slog.String("error", err.Error()))
+}
+
+// dispatchChunk routes a single decoded chunk to the reply table, an in-flight
+// Create, or the per-context listener, filtering non-user-visible lifecycle
+// control chunks. Split out of readLoop so the read loop can stay focused on
+// framing/recovery.
+func (h *tsHost) dispatchChunk(chunk *WorkerChunk) {
+	// Reply chunks (e.g., list-packages) are routed to the factory's reply table.
+	if chunk.Type == ChunkTypeControl && chunk.Text == "list-packages-result" {
+		h.factory.replyMu.Lock()
+		ch := h.factory.pendingReps[chunk.Reply]
+		h.factory.replyMu.Unlock()
+		if ch != nil {
+			ch <- chunk
+		}
+		return
+	}
+	// Create acknowledgment ("created" control or a create-time error) is routed
+	// back to the in-flight Create call rather than to the per-context listener.
+	if chunk.SessionID != "" &&
+		((chunk.Type == ChunkTypeControl && chunk.Text == "created") || chunk.Type == ChunkTypeError) {
+		if h.deliverCreate(chunk) {
+			return
+		}
+	}
+	// Lifecycle control chunks ("created"/"deleted"/"interrupted"/"host-ready") are
+	// not user-visible; only "completed" must reach the per-context handler.
+	if chunk.Type == ChunkTypeControl && chunk.Text != ControlChunkTypeCompleted &&
+		chunk.Text != ControlChunkTypeInterrupted {
+		return
+	}
+	// Per-context chunk → look up the listener and dispatch.
+	if chunk.SessionID == "" {
+		h.logger.Debug("dropping chunk without sessionId")
+		return
+	}
+	h.mu.Lock()
+	listener := h.listeners[chunk.SessionID]
+	h.mu.Unlock()
+	if listener != nil {
+		listener(chunk)
+	}
+}
+
+// reportOversizedLine surfaces an over-long output frame as an error+completed
+// pair to every registered listener. We cannot know which context emitted the
+// dropped bytes (the sessionId lived inside the unparseable frame), so — to keep
+// the shared host alive ([C3]) without hanging any waiter — we notify all
+// currently-registered contexts. With the emit-side cap in place this is
+// unreachable in practice. Snapshot listeners under the lock, dispatch outside.
+func (h *tsHost) reportOversizedLine() {
+	h.logger.Warn("dropping oversized ts host chunk", slog.Int("limit", maxWorkerLineBytes))
+	h.mu.Lock()
+	listeners := make(map[string]func(*WorkerChunk), len(h.listeners))
+	for id, fn := range h.listeners {
+		listeners[id] = fn
+	}
+	h.mu.Unlock()
+	msg := fmt.Sprintf("ts host output frame exceeded %d bytes and was dropped", maxWorkerLineBytes)
+	for id, fn := range listeners {
+		if fn == nil {
+			continue
+		}
+		fn(&WorkerChunk{SessionID: id, Type: ChunkTypeError, Name: "WorkerProcessError", Value: msg})
+		fn(&WorkerChunk{SessionID: id, Type: ChunkTypeControl, Text: ControlChunkTypeCompleted})
 	}
 }
 

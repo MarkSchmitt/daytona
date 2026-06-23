@@ -21,6 +21,31 @@ const readline = require('node:readline')
 const fs = require('node:fs')
 const fsp = require('node:fs/promises')
 
+// Max bytes for any single text payload written into an output frame. A single
+// frame is one stdout/stderr/display chunk on the wire; capping it here (the
+// emit side) means no single line/frame can blow past the reader's bounded line
+// size on the Go side, regardless of how much the user code prints in one shot.
+const MAX_CHUNK_BYTES = 1 << 20 // 1 MiB
+
+// truncateText caps a UTF-8 text payload at MAX_CHUNK_BYTES, appending a clear
+// marker reporting how many bytes were dropped. Returns the input untouched when
+// it is already within budget (the common case).
+function truncateText(s) {
+  if (typeof s !== 'string') return s
+  // Fast path: assume <= MAX_CHUNK_BYTES chars are <= MAX_CHUNK_BYTES bytes is
+  // false for multibyte, so measure exactly when the char length is in range.
+  const byteLen = Buffer.byteLength(s, 'utf8')
+  if (byteLen <= MAX_CHUNK_BYTES) return s
+  // Slice on a byte boundary, then back off to a valid UTF-8 boundary so we
+  // never emit a split multibyte sequence.
+  const buf = Buffer.from(s, 'utf8')
+  let end = MAX_CHUNK_BYTES
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end--
+  const kept = buf.toString('utf8', 0, end)
+  const omitted = byteLen - end
+  return kept + `…[output truncated: ${omitted} bytes omitted]`
+}
+
 // stdoutMutex / emit are declared FIRST because the boot-error catch handlers
 // below call emit() before any other initialization runs. Reordering this
 // triggers a temporal-dead-zone ReferenceError that masks the real boot error.
@@ -33,6 +58,20 @@ const stdoutMutex = (() => {
 })()
 
 function emit(chunk) {
+  // Cap oversized text payloads (stdout/stderr/error/display) before serializing
+  // so no single frame can be unbounded — see MAX_CHUNK_BYTES. Truncation is
+  // applied per text-bearing field rather than to the whole JSON line so the
+  // structure stays intact and the omitted-bytes marker lands inside the field.
+  if (chunk && typeof chunk === 'object') {
+    if (typeof chunk.text === 'string') chunk.text = truncateText(chunk.text)
+    if (typeof chunk.value === 'string') chunk.value = truncateText(chunk.value)
+    if (typeof chunk.traceback === 'string') chunk.traceback = truncateText(chunk.traceback)
+    if (chunk.data && typeof chunk.data === 'object') {
+      for (const mime of Object.keys(chunk.data)) {
+        if (typeof chunk.data[mime] === 'string') chunk.data[mime] = truncateText(chunk.data[mime])
+      }
+    }
+  }
   // Single-writer through stdoutMutex so concurrent sessions don't interleave bytes.
   stdoutMutex(() => {
     try {
@@ -253,6 +292,12 @@ class ContextRecord {
           // user code runs against pristine globals. Reusing the outer Session
           // (~3-5 ms) is what makes transient-context one-shot calls cheap
           // compared to a full ContextRecord rebuild. See ExecuteRequest.Reset.
+          //
+          // Clear the OLD context's timers FIRST: #bootContext reassigns
+          // this._timers to a fresh Map, so without clearing here the previously
+          // tracked intervals/timeouts keep firing against the discarded context
+          // and leak host-side handles. See dispose() for the same teardown.
+          this.#clearAllTimers()
           this.modules = new Map()
           this.contextPromise = this.#bootContext()
         }
@@ -421,17 +466,23 @@ class ContextRecord {
     emit({ sessionId: this.id, type: 'display', formats, data })
   }
 
+  // Clear every still-pending user timer (intervals especially) and empty the
+  // tracking Map. Shared by dispose() and the reset path in exec() so a context
+  // recycle doesn't leak timers that keep firing against a discarded context.
+  #clearAllTimers() {
+    if (!this._timers) return
+    for (const handle of this._timers.values()) {
+      clearTimeout(handle)
+      clearInterval(handle)
+    }
+    this._timers.clear()
+  }
+
   async dispose() {
     this.disposed = true
     // Clear any pending user timers so a leftover setInterval doesn't keep
     // firing (and leaking host-side handles) after the isolate is gone.
-    if (this._timers) {
-      for (const handle of this._timers.values()) {
-        clearTimeout(handle)
-        clearInterval(handle)
-      }
-      this._timers.clear()
-    }
+    this.#clearAllTimers()
     // The compiled Modules are owned by the session and are torn down with it;
     // we just drop our references. Explicit module.release() is unnecessary
     // because session.dispose() reclaims everything in one shot.
