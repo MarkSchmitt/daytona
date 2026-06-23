@@ -4,10 +4,10 @@ use (
 	./apps/cli
 	./apps/daemon
 	./apps/daytona-e2e
-	./apps/session-daemon
 	./apps/otel-collector/exporter
 	./apps/proxy
 	./apps/runner
+	./apps/session-daemon
 	./apps/snapshot-manager
 	./apps/ssh-gateway
 	./libs/api-client-go

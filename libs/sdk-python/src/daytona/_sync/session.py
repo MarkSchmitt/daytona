@@ -14,6 +14,10 @@ preserved as transparent fallbacks for older API servers that don't yet
 expose `/access` / `/transients`.
 """
 
+# The optional websocket-client dependency ships no type stubs, so its symbols are
+# untyped here; scoped to this file to keep the rest of the SDK strict.
+# pyright: reportUnknownVariableType=false, reportUnknownArgumentType=false
+
 from __future__ import annotations
 
 import json
@@ -291,8 +295,8 @@ class SessionService:
     ) -> SessionRunResult:
         try:
             # pylint: disable-next=import-outside-toplevel
-            from websocket import (
-                WebSocket,  # type: ignore[import-not-found]
+            from websocket import (  # pyright: ignore[reportMissingImports]
+                WebSocket,
                 WebSocketBadStatusException,
                 WebSocketException,
             )
@@ -486,7 +490,7 @@ class SessionService:
     ) -> SessionRunResult:
         try:
             # pylint: disable-next=import-outside-toplevel
-            from websocket import WebSocket  # type: ignore[import-not-found]
+            from websocket import WebSocket  # pyright: ignore[reportMissingImports]
         except ImportError as exc:
             raise DaytonaError(
                 "run_stream requires the 'websocket-client' package; install with `pip install websocket-client`"

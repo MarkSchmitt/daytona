@@ -1,0 +1,426 @@
+---
+title: "Session"
+hideTitleOnPage: true
+---
+
+
+## SessionExpiredError
+
+SessionExpiredError is the SDK projection of HTTP 410
+`error.name=SessionExpired`. `reason` distinguishes idle vs absolute TTL.
+
+**Properties**:
+
+- `data?` _unknown_ - Raw response body if available (preserved so callers can inspect error envelopes)
+    - _Inherited from_: `DaytonaError.data`
+- `errorCode?` _string_ - Machine-readable error code if available
+    - _Inherited from_: `DaytonaError.errorCode`
+- `expiredAt` _string_
+- `headers?` _AxiosHeaders_ - Response headers if available
+    - _Inherited from_: `DaytonaError.headers`
+- `reason` _"idle" \| "absolute"_
+- `sessionId` _string_
+- `statusCode?` _number_ - HTTP status code if available
+    
+    - _Inherited from_: `DaytonaError.statusCode`
+
+
+
+
+**Extends:**
+
+- `DaytonaError`
+
+### Constructors
+
+#### new SessionExpiredError()
+
+```ts
+new SessionExpiredError(
+   sessionId: string, 
+   expiredAt: string, 
+   reason: "idle" | "absolute"): SessionExpiredError
+```
+
+**Parameters**:
+
+- `sessionId` _string_
+- `expiredAt` _string_
+- `reason` _"idle" \| "absolute"_
+
+
+**Returns**:
+
+- `SessionExpiredError`
+
+##### Overrides
+
+`DaytonaError`.`constructor`
+## SessionInvalidatedError
+
+SessionInvalidatedError is the SDK projection of HTTP 410
+`error.name=SessionInvalidated`. Surfaces when the underlying sandbox
+has been rolled (death / snapshot drift / autostop).
+
+**Properties**:
+
+- `data?` _unknown_ - Raw response body if available (preserved so callers can inspect error envelopes)
+    - _Inherited from_: `DaytonaError.data`
+- `errorCode?` _string_ - Machine-readable error code if available
+    - _Inherited from_: `DaytonaError.errorCode`
+- `headers?` _AxiosHeaders_ - Response headers if available
+    - _Inherited from_: `DaytonaError.headers`
+- `invalidatedAt` _string_
+- `sessionId` _string_
+- `statusCode?` _number_ - HTTP status code if available
+    
+    - _Inherited from_: `DaytonaError.statusCode`
+
+
+
+
+**Extends:**
+
+- `DaytonaError`
+
+### Constructors
+
+#### new SessionInvalidatedError()
+
+```ts
+new SessionInvalidatedError(sessionId: string, invalidatedAt: string): SessionInvalidatedError
+```
+
+**Parameters**:
+
+- `sessionId` _string_
+- `invalidatedAt` _string_
+
+
+**Returns**:
+
+- `SessionInvalidatedError`
+
+##### Overrides
+
+`DaytonaError`.`constructor`
+## SessionService
+
+SessionService is the user-facing SDK surface for the sessions product.
+
+The hot path (`run` / `runStream`) skips the Daytona API and talks directly
+to the in-sandbox session-daemon via the proxy chain — same shape
+`sandbox.process.code_run` uses against the classic daytona-daemon. The API
+is only hit on `createSession` / first one-shot / token refresh (every ~5
+min) / on invalidation. Legacy `POST /sessions/code-run` and
+`POST /sessions/connect` remain as transparent fallbacks for older API
+servers.
+
+### Constructors
+
+#### new SessionService()
+
+```ts
+new SessionService(http: AxiosInstance): SessionService
+```
+
+**Parameters**:
+
+- `http` _AxiosInstance_
+
+
+**Returns**:
+
+- `SessionService`
+
+### Methods
+
+#### createSession()
+
+```ts
+createSession(options: {
+  cwd: string;
+  language: string;
+  template: string;
+}): Promise<SessionRef>
+```
+
+**Parameters**:
+
+- `options` _###### cwd?_ - `string`
+- `language?` _string_
+- `template?` _string_
+
+
+**Returns**:
+
+- `Promise<SessionRef>`
+
+***
+
+#### deleteSession()
+
+```ts
+deleteSession(id: string): Promise<void>
+```
+
+**Parameters**:
+
+- `id` _string_
+
+
+**Returns**:
+
+- `Promise<void>`
+
+***
+
+#### listPackages()
+
+```ts
+listPackages(templateName: string, language: string): Promise<{
+  hasNativeBindings: boolean;
+  name: string;
+  version: string;
+}[]>
+```
+
+**Parameters**:
+
+- `templateName` _string_
+- `language` _string_
+
+
+**Returns**:
+
+- `Promise<{
+  hasNativeBindings: boolean;
+  name: string;
+  version: string;
+ }[]>`
+
+***
+
+#### listSessions()
+
+```ts
+listSessions(template?: string): Promise<SessionRef[]>
+```
+
+**Parameters**:
+
+- `template?` _string_
+
+
+**Returns**:
+
+- `Promise<SessionRef[]>`
+
+***
+
+#### listTemplates()
+
+```ts
+listTemplates(): Promise<{
+  description: string;
+  languages: string[];
+  name: string;
+  packages: string[];
+}[]>
+```
+
+**Returns**:
+
+- `Promise<{
+  description: string;
+  languages: string[];
+  name: string;
+  packages: string[];
+ }[]>`
+
+***
+
+#### run()
+
+```ts
+run(code: string, options: SessionRunOptions): Promise<SessionRunResult>
+```
+
+**Parameters**:
+
+- `code` _string_
+- `options` _SessionRunOptions = {}_
+
+
+**Returns**:
+
+- `Promise<SessionRunResult>`
+
+***
+
+#### runStream()
+
+```ts
+runStream(code: string, options: SessionRunStreamOptions): Promise<SessionRunResult>
+```
+
+**Parameters**:
+
+- `code` _string_
+- `options` _SessionRunStreamOptions = {}_
+
+
+**Returns**:
+
+- `Promise<SessionRunResult>`
+
+***
+
+
+## SessionAccess
+
+Signed direct-to-sandbox access bundle returned by the API.
+
+**Properties**:
+
+- `httpUrl` _string_
+- `token` _string_
+- `tokenExpiresAt` _string_ - ISO timestamp; the SDK refreshes shortly before this.
+- `wsUrl` _string_
+
+
+
+
+The SDK opens a WebSocket directly to `wsUrl` on the in-sandbox session-daemon
+via the proxy chain — the URL is self-authenticating (the signed token lives
+in the proxy subdomain). `token` is exposed for revocation / observability;
+the SDK does NOT send it as an `Authorization` header.
+## SessionDisplay
+
+**Properties**:
+
+- `data` _Record\<string, string\>_ - Mime → payload (base64 for binary).
+- `formats` _string\[\]_
+## SessionExecutionError
+
+**Properties**:
+
+- `name` _string_
+- `traceback?` _string_
+- `value?` _string_
+## SessionRef
+
+**Properties**:
+
+- `access?` _SessionAccess_ - Present on createSession / refresh responses; omitted on listSessions.
+- `createdAt` _string_
+- `cwd?` _string_
+- `expiresAt` _string_
+- `id` _string_
+- `language` _string_
+- `lastUsedAt?` _string_
+## SessionRunOptions
+
+### Extended by
+
+**Properties**:
+
+- `access?` _SessionAccess_ - ##### id
+    
+    ```ts
+    id: string;
+    ```
+- `env?` _Record\<string, string\>_
+- `language?` _"typescript" \| "python" \| "javascript"_
+- `template?` _string_
+- `timeout?` _number_
+
+
+
+
+- `SessionRunStreamOptions`
+## SessionRunResult
+
+**Properties**:
+
+- `displays` _SessionDisplay\[\]_
+- `durationMs` _number_
+- `error` _SessionExecutionError_
+- `stderr` _string_
+- `stdout` _string_
+## SessionRunStreamOptions
+
+**Extends:**
+
+**Properties**:
+
+- `access?` _SessionAccess_ - ##### id
+    
+    ```ts
+    id: string;
+    ```
+    
+    ##### Inherited from
+    
+    `SessionRunOptions`.`context`
+- `env?` _Record\<string, string\>_
+    - _Inherited from_: `SessionRunOptions.env`
+- `language?` _"typescript" \| "python" \| "javascript"_
+    - _Inherited from_: `SessionRunOptions.language`
+- `onControl()?` _\(text: string\) =\> void_ - **Parameters**:
+    
+    - `text` _string_
+    
+    
+    **Returns**:
+    
+    - `void`
+- `onDisplay()?` _\(display: SessionDisplay\) =\> void_ - **Parameters**:
+    
+    - `display` _SessionDisplay_
+    
+    
+    **Returns**:
+    
+    - `void`
+- `onError()?` _\(err: SessionExecutionError\) =\> void_ - **Parameters**:
+    
+    - `err` _SessionExecutionError_
+    
+    
+    **Returns**:
+    
+    - `void`
+- `onStderr()?` _\(chunk: string\) =\> void_ - **Parameters**:
+    
+    - `chunk` _string_
+    
+    
+    **Returns**:
+    
+    - `void`
+- `onStdout()?` _\(chunk: string\) =\> void_ - **Parameters**:
+    
+    - `chunk` _string_
+    
+    
+    **Returns**:
+    
+    - `void`
+- `signal?` _AbortSignal_
+- `template?` _string_
+    - _Inherited from_: `SessionRunOptions.template`
+- `timeout?` _number_
+    - _Inherited from_: `SessionRunOptions.timeout`
+
+
+
+
+- `SessionRunOptions`
+## SessionFrameType
+
+```ts
+type SessionFrameType = "stdout" | "stderr" | "error" | "display" | "control";
+```
+
+One frame on the streaming WS protocol. Mirrors the daemon-side frame format 1:1.
