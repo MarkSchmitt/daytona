@@ -46,8 +46,22 @@ func NewServer(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		logger.Warn("typescript factory unavailable; daemon will serve python only", slog.String("error", err.Error()))
 		tsFactory = nil
 	}
+	bashFactory, err := interpreter.NewBashFactory(cfg, logger)
+	if err != nil {
+		// Bash support is best-effort like TS: if node / just-bash is missing,
+		// log and continue without the bash engine (and the Python bash() bridge).
+		logger.Warn("bash factory unavailable; daemon will serve without bash", slog.String("error", err.Error()))
+		bashFactory = nil
+	}
 
-	mgr := interpreter.NewManager(cfg, logger, pyFactory, asWorkerFactory(tsFactory))
+	// Wire the Python bash() bridge: Python user code shells out to just-bash via
+	// the shared bash host. No-op when bash is unavailable (bash() then errors
+	// with a clear "bash runtime unavailable" message in the worker).
+	if bashFactory != nil {
+		pyFactory.SetBashInvoker(bashFactory)
+	}
+
+	mgr := interpreter.NewManager(cfg, logger, pyFactory, asWorkerFactory(tsFactory), asBashWorkerFactory(bashFactory))
 	return &Server{
 		cfg:       cfg,
 		logger:    logger,
@@ -59,6 +73,15 @@ func NewServer(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 // asWorkerFactory adapts *TSFactory to the WorkerFactory interface, returning a
 // nil interface when the input is nil so the Manager can detect the unavailable case.
 func asWorkerFactory(f *interpreter.TSFactory) interpreter.WorkerFactory {
+	if f == nil {
+		return nil
+	}
+	return f
+}
+
+// asBashWorkerFactory mirrors asWorkerFactory for *BashFactory so a nil concrete
+// pointer becomes a nil interface (avoids the typed-nil-in-interface trap).
+func asBashWorkerFactory(f *interpreter.BashFactory) interpreter.WorkerFactory {
 	if f == nil {
 		return nil
 	}
@@ -150,12 +173,13 @@ func (s *Server) handleListSessions(c *gin.Context) {
 // sub-blocks are omitted when cgroup files aren't readable, so the API falls back to
 // concurrency-only saturation.
 func (s *Server) handleLoad(c *gin.Context) {
-	active, busy, pyMax, tsMax := s.manager.LoadCounts()
+	active, busy, pyMax, tsMax, bashMax := s.manager.LoadCounts()
 	resp := gin.H{
 		"activeContexts": active,
 		"busyContexts":   busy,
 		"pyMax":          pyMax,
 		"tsMax":          tsMax,
+		"bashMax":        bashMax,
 	}
 	sample := s.loadStats.Sample(time.Now())
 	if sample.CPU != nil {

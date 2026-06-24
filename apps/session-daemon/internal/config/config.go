@@ -27,9 +27,12 @@ type Config struct {
 	HostScriptCacheDir string `envconfig:"SESSION_DAEMON_HOST_SCRIPT_CACHE_DIR" default:"/tmp"`
 
 	// Per-engine concurrency caps. The 4x difference between TS and Python is intentional
-	// and reflects the memory floor of each engine — see plan §7.
-	TSMaxContexts int `envconfig:"SESSION_DAEMON_TS_MAX_SESSIONS" default:"64"`
-	PyMaxContexts int `envconfig:"SESSION_DAEMON_PY_MAX_SESSIONS" default:"16"`
+	// and reflects the memory floor of each engine — see plan §7. Bash isolates are
+	// virtual just-bash shells (no subprocess, no V8 heap), so they're the cheapest
+	// of the three and carry a much higher default cap.
+	TSMaxContexts   int `envconfig:"SESSION_DAEMON_TS_MAX_SESSIONS" default:"64"`
+	PyMaxContexts   int `envconfig:"SESSION_DAEMON_PY_MAX_SESSIONS" default:"16"`
+	BashMaxContexts int `envconfig:"SESSION_DAEMON_BASH_MAX_SESSIONS" default:"128"`
 
 	// Default + ceiling for TS context memory limit (in MB).
 	TSDefaultMemoryMB int `envconfig:"SESSION_DAEMON_TS_DEFAULT_MEMORY_MB" default:"128"`
@@ -70,6 +73,9 @@ func (c *Config) Validate() error {
 	}
 	if c.PyMaxContexts < 1 {
 		return fmt.Errorf("SESSION_DAEMON_PY_MAX_SESSIONS must be >= 1")
+	}
+	if c.BashMaxContexts < 1 {
+		return fmt.Errorf("SESSION_DAEMON_BASH_MAX_SESSIONS must be >= 1")
 	}
 	if c.TSDefaultMemoryMB <= 0 || c.TSDefaultMemoryMB > c.TSMaxMemoryMB {
 		return fmt.Errorf("SESSION_DAEMON_TS_DEFAULT_MEMORY_MB must be in (0, %d]", c.TSMaxMemoryMB)

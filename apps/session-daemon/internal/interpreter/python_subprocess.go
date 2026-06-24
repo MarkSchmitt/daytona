@@ -46,7 +46,15 @@ type PythonFactory struct {
 	poolStop    chan struct{}
 	poolWG      sync.WaitGroup
 	poolStarted bool
+
+	// bashInvoker backs the Python bash() bridge. nil when the bash engine is
+	// unavailable, in which case bash() raises "bash runtime unavailable".
+	bashInvoker BashInvoker
 }
+
+// SetBashInvoker wires the bash() bridge for Python workers. Called once at
+// server construction (before any context is created), so no locking is needed.
+func (f *PythonFactory) SetBashInvoker(inv BashInvoker) { f.bashInvoker = inv }
 
 // warmPython is an already-spawned CPython REPL waiting to be wired up to a
 // context. Its stdout has NOT been read yet (the REPL emits nothing until it
@@ -98,14 +106,15 @@ func (f *PythonFactory) Create(ctxID string, _ CreateSessionRequest, onChunk fun
 	defer f.scheduleRefill()
 
 	w := &pythonSubprocessWorker{
-		ctxID:   ctxID,
-		cmd:     warm.cmd,
-		stdin:   warm.stdin,
-		stdout:  warm.stdout,
-		onChunk: onChunk,
-		cancel:  warm.cancel,
-		done:    make(chan struct{}),
-		logger:  f.logger.With(slog.String("ctx", ctxID), slog.Int("pid", warm.cmd.Process.Pid)),
+		ctxID:       ctxID,
+		cmd:         warm.cmd,
+		stdin:       warm.stdin,
+		stdout:      warm.stdout,
+		onChunk:     onChunk,
+		cancel:      warm.cancel,
+		done:        make(chan struct{}),
+		bashInvoker: f.bashInvoker,
+		logger:      f.logger.With(slog.String("ctx", ctxID), slog.Int("pid", warm.cmd.Process.Pid)),
 	}
 	w.active.Store(true)
 
@@ -259,10 +268,34 @@ type pythonSubprocessWorker struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 
-	mu     sync.Mutex
-	closed bool
-	active activeFlag
-	logger *slog.Logger
+	mu      sync.Mutex
+	stdinMu sync.Mutex // serializes writes to the worker's stdin (exec cmds + hostcall replies)
+	closed  bool
+	active  activeFlag
+
+	bashInvoker BashInvoker
+	logger      *slog.Logger
+}
+
+// hostCall is a request the Python worker emits on stdout when user code calls
+// bash() — the bridge round-trip. The daemon routes it to the bash host and
+// writes a hostCallResult back to the worker's stdin (correlated by ID).
+type hostCall struct {
+	ID     string            `json:"id"`
+	Method string            `json:"method"`
+	Cmd    string            `json:"cmd"`
+	Env    map[string]string `json:"env"`
+}
+
+// hostCallResult is the reply written back to the worker's stdin. Type is
+// "hostcall_result" on success or "hostcall_error" on failure.
+type hostCallResult struct {
+	Type     string `json:"type"`
+	ID       string `json:"id"`
+	Stdout   string `json:"stdout,omitempty"`
+	Stderr   string `json:"stderr,omitempty"`
+	ExitCode int    `json:"exitCode"`
+	Message  string `json:"message,omitempty"`
 }
 
 // activeFlag is a tiny wrapper to avoid pulling sync/atomic.Bool in older toolchains.
@@ -302,10 +335,54 @@ func (w *pythonSubprocessWorker) Send(cmd WorkerCommand) error {
 		return err
 	}
 	data = append(data, '\n')
-	if _, err := w.stdin.Write(data); err != nil {
+	if err := w.writeStdin(data); err != nil {
 		return fmt.Errorf("worker stdin: %w", err)
 	}
 	return nil
+}
+
+// writeStdin serializes all writes to the worker's stdin. Both exec commands
+// (Send) and bash() hostcall replies (handleHostCall) go through here so they
+// never interleave bytes on the pipe.
+func (w *pythonSubprocessWorker) writeStdin(data []byte) error {
+	w.stdinMu.Lock()
+	defer w.stdinMu.Unlock()
+	_, err := w.stdin.Write(data)
+	return err
+}
+
+// handleHostCall services a bash() bridge request: run the command on the shared
+// bash host and write the correlated result back to the worker's stdin. Runs in
+// its own goroutine so a slow command never stalls the worker's read loop (and
+// thus can't delay processing an interrupt). The Python worker is blocked on
+// stdin awaiting this reply; if it was interrupted first, it discards the stray
+// reply (see repl_worker.py handle_command).
+func (w *pythonSubprocessWorker) handleHostCall(hc *hostCall) {
+	res := hostCallResult{ID: hc.ID, Type: "hostcall_result"}
+	switch {
+	case hc.Method != "bash":
+		res.Type = "hostcall_error"
+		res.Message = "unknown hostcall method: " + hc.Method
+	case w.bashInvoker == nil:
+		res.Type = "hostcall_error"
+		res.Message = "bash runtime unavailable"
+	default:
+		stdout, stderr, code, err := w.bashInvoker.Call(w.ctxID, hc.Cmd, hc.Env)
+		if err != nil {
+			res.Type = "hostcall_error"
+			res.Message = err.Error()
+		} else {
+			res.Stdout, res.Stderr, res.ExitCode = stdout, stderr, code
+		}
+	}
+	data, err := json.Marshal(res)
+	if err != nil {
+		return
+	}
+	data = append(data, '\n')
+	if err := w.writeStdin(data); err != nil {
+		w.logger.Debug("hostcall reply write failed", slog.String("error", err.Error()))
+	}
 }
 
 func (w *pythonSubprocessWorker) Interrupt() error {
@@ -329,6 +406,11 @@ func (w *pythonSubprocessWorker) Shutdown() error {
 	stdin := w.stdin
 	cancel := w.cancel
 	w.mu.Unlock()
+
+	// Drop the per-session shell backing this context's bash() bridge (if any).
+	if w.bashInvoker != nil {
+		w.bashInvoker.Release(w.ctxID)
+	}
 
 	// Teardown is best-effort: the process/pipe may already be gone, which surfaces
 	// as benign races (os.ErrProcessDone, os.ErrClosed). Only collect genuine errors
@@ -448,6 +530,15 @@ func (w *pythonSubprocessWorker) readLoop() {
 			var chunk WorkerChunk
 			if jerr := json.Unmarshal([]byte(line), &chunk); jerr != nil {
 				w.logger.Warn("ignoring malformed worker chunk", slog.String("error", jerr.Error()))
+			} else if chunk.Type == "hostcall" {
+				// bash() bridge request: route to the bash host and write the
+				// result back to the worker's stdin. NOT forwarded as session
+				// output. Handled off the read loop so a slow command can't delay
+				// interrupt processing (see handleHostCall).
+				var hc hostCall
+				if uerr := json.Unmarshal([]byte(line), &hc); uerr == nil {
+					go w.handleHostCall(&hc)
+				}
 			} else {
 				chunk.SessionID = w.ctxID
 				if w.onChunk != nil {

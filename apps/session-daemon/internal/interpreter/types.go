@@ -61,6 +61,7 @@ const (
 	LanguagePython     = "python"
 	LanguageTypeScript = "typescript"
 	LanguageJavaScript = "javascript"
+	LanguageBash       = "bash"
 )
 
 // CreateSessionRequest is the body of POST /sessions.
@@ -169,6 +170,11 @@ type WorkerChunk struct {
 	Data      map[string]string `json:"data,omitempty"`
 	Packages  []PackageInfo     `json:"packages,omitempty"`
 	Reply     string            `json:"reply,omitempty"` // request-reply id (e.g., "list-packages-<n>")
+	// Bash one-shot call result fields (carried on the "bash-call-result"
+	// control chunk used by the TS/Python bash() bridges).
+	Stdout   string `json:"stdout,omitempty"`
+	Stderr   string `json:"stderr,omitempty"`
+	ExitCode int    `json:"exitCode,omitempty"`
 }
 
 // closeRequest is an internal frame asking the WS writer to send a close message.

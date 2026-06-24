@@ -26,8 +26,9 @@ type Manager struct {
 	cfg    *config.Config
 	logger *slog.Logger
 
-	pyFactory WorkerFactory
-	tsFactory WorkerFactory
+	pyFactory   WorkerFactory
+	tsFactory   WorkerFactory
+	bashFactory WorkerFactory
 
 	mu       sync.RWMutex
 	contexts map[string]*Session
@@ -45,14 +46,15 @@ type WorkerFactory interface {
 }
 
 // NewManager constructs a Manager and starts background goroutines.
-func NewManager(cfg *config.Config, logger *slog.Logger, pyFactory, tsFactory WorkerFactory) *Manager {
+func NewManager(cfg *config.Config, logger *slog.Logger, pyFactory, tsFactory, bashFactory WorkerFactory) *Manager {
 	m := &Manager{
-		cfg:       cfg,
-		logger:    logger.With(slog.String("component", "manager")),
-		pyFactory: pyFactory,
-		tsFactory: tsFactory,
-		contexts:  make(map[string]*Session),
-		stopCh:    make(chan struct{}),
+		cfg:         cfg,
+		logger:      logger.With(slog.String("component", "manager")),
+		pyFactory:   pyFactory,
+		tsFactory:   tsFactory,
+		bashFactory: bashFactory,
+		contexts:    make(map[string]*Session),
+		stopCh:      make(chan struct{}),
 	}
 
 	m.wg.Add(1)
@@ -90,6 +92,9 @@ func (m *Manager) Close() {
 	}
 	if m.tsFactory != nil {
 		m.tsFactory.Shutdown()
+	}
+	if m.bashFactory != nil {
+		m.bashFactory.Shutdown()
 	}
 }
 
@@ -158,19 +163,26 @@ func (m *Manager) factoryFor(lang string) (WorkerFactory, error) {
 			return nil, fmt.Errorf("%w: typescript factory not registered", ErrUnsupportedLang)
 		}
 		return m.tsFactory, nil
+	case LanguageBash:
+		if m.bashFactory == nil {
+			return nil, fmt.Errorf("%w: bash factory not registered", ErrUnsupportedLang)
+		}
+		return m.bashFactory, nil
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnsupportedLang, lang)
 	}
 }
 
 func (m *Manager) checkCapacityLocked(lang string) error {
-	pyCount, tsCount := 0, 0
+	pyCount, tsCount, bashCount := 0, 0, 0
 	for _, c := range m.contexts {
 		switch c.info.Language {
 		case LanguagePython:
 			pyCount++
 		case LanguageTypeScript:
 			tsCount++
+		case LanguageBash:
+			bashCount++
 		}
 	}
 	switch normalizeLanguage(lang) {
@@ -181,6 +193,10 @@ func (m *Manager) checkCapacityLocked(lang string) error {
 	case LanguageTypeScript:
 		if tsCount >= m.cfg.TSMaxContexts {
 			return fmt.Errorf("%w: typescript contexts at cap (%d)", ErrCapacity, m.cfg.TSMaxContexts)
+		}
+	case LanguageBash:
+		if bashCount >= m.cfg.BashMaxContexts {
+			return fmt.Errorf("%w: bash contexts at cap (%d)", ErrCapacity, m.cfg.BashMaxContexts)
 		}
 	}
 	return nil
@@ -263,7 +279,7 @@ func (m *Manager) Healthz() bool {
 
 // LoadCounts returns a snapshot of context concurrency for the /load endpoint:
 // total active contexts, contexts with an in-flight exec, and the per-language caps.
-func (m *Manager) LoadCounts() (active, busy, pyMax, tsMax int) {
+func (m *Manager) LoadCounts() (active, busy, pyMax, tsMax, bashMax int) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	active = len(m.contexts)
@@ -272,7 +288,7 @@ func (m *Manager) LoadCounts() (active, busy, pyMax, tsMax int) {
 			busy++
 		}
 	}
-	return active, busy, m.cfg.PyMaxContexts, m.cfg.TSMaxContexts
+	return active, busy, m.cfg.PyMaxContexts, m.cfg.TSMaxContexts, m.cfg.BashMaxContexts
 }
 
 // WorkspaceRoot exposes the configured workspace root so the server can statfs the
@@ -283,6 +299,8 @@ func normalizeLanguage(lang string) string {
 	switch lang {
 	case LanguageJavaScript:
 		return LanguageTypeScript
+	case "sh":
+		return LanguageBash
 	case "":
 		return LanguagePython
 	default:

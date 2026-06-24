@@ -31,3 +31,14 @@ type Worker interface {
 	// Active reports whether the worker is currently usable.
 	Active() bool
 }
+
+// BashInvoker runs a single bash command on the shared just-bash host and
+// returns the aggregated result. It backs the Python bash() bridge: the Python
+// worker emits a hostcall over stdio, the daemon routes it here, and writes the
+// result back. The TS bridge does not use this — it runs just-bash in its own
+// Node host, in-process. Per-session state (overlay) is keyed by sessionID;
+// Release drops it when the session ends.
+type BashInvoker interface {
+	Call(sessionID, code string, env map[string]string) (stdout, stderr string, exitCode int, err error)
+	Release(sessionID string)
+}
