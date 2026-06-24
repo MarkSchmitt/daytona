@@ -23,9 +23,10 @@ type Worker interface {
 	// gracePeriod. For V8 session workers it disposes and recreates the session.
 	Interrupt() error
 
-	// Shutdown tears the worker down. After Shutdown returns, Send and Interrupt
-	// are no-ops and the worker may be discarded.
-	Shutdown()
+	// Shutdown tears the worker down and returns any teardown error so the
+	// caller can log it. After Shutdown returns, Send and Interrupt are no-ops
+	// and the worker may be discarded.
+	Shutdown() error
 
 	// Active reports whether the worker is currently usable.
 	Active() bool

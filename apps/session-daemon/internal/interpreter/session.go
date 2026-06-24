@@ -6,6 +6,7 @@ package interpreter
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -289,7 +290,15 @@ func (c *Session) shutdown() {
 		go c.drainAndClose(queue)
 	}
 	if worker != nil {
-		worker.Shutdown()
+		// Best-effort teardown: log the error rather than propagate, since
+		// shutdown() is invoked from delete/idle-sweep paths that have nothing
+		// to do with a failed worker teardown beyond surfacing it.
+		if err := worker.Shutdown(); err != nil && c.logger != nil {
+			c.logger.Warn("worker shutdown error",
+				slog.String("id", c.info.ID),
+				slog.String("error", err.Error()),
+			)
+		}
 	}
 	if cl != nil {
 		cl.requestClose(websocket.CloseGoingAway, "context shutdown")

@@ -5,6 +5,7 @@ package interpreter
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -226,4 +227,8 @@ type Session struct {
 
 	// Currently attached WebSocket client (only one at a time).
 	client *wsClient
+
+	// logger is used for best-effort teardown diagnostics (e.g. worker.Shutdown
+	// errors). May be nil for sessions constructed without a manager logger.
+	logger *slog.Logger
 }

@@ -495,10 +495,11 @@ func (w *tsHostWorker) Interrupt() error {
 	return w.host.send(WorkerCommand{Op: "interrupt", SessionID: w.ctxID})
 }
 
-func (w *tsHostWorker) Shutdown() {
+func (w *tsHostWorker) Shutdown() error {
 	if !w.active.Swap(false) {
-		return
+		return nil
 	}
-	_ = w.host.send(WorkerCommand{Op: "delete", SessionID: w.ctxID})
+	err := w.host.send(WorkerCommand{Op: "delete", SessionID: w.ctxID})
 	w.host.unregister(w.ctxID)
+	return err
 }

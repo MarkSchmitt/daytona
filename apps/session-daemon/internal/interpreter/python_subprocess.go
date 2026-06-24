@@ -317,11 +317,11 @@ func (w *pythonSubprocessWorker) Interrupt() error {
 	return w.cmd.Process.Signal(syscall.SIGINT)
 }
 
-func (w *pythonSubprocessWorker) Shutdown() {
+func (w *pythonSubprocessWorker) Shutdown() error {
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
-		return
+		return nil
 	}
 	w.closed = true
 	w.active.Store(false)
@@ -330,11 +330,16 @@ func (w *pythonSubprocessWorker) Shutdown() {
 	cancel := w.cancel
 	w.mu.Unlock()
 
+	var errs []error
 	if stdin != nil {
-		_ = stdin.Close()
+		if err := stdin.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close stdin: %w", err))
+		}
 	}
 	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Signal(syscall.SIGTERM)
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			errs = append(errs, fmt.Errorf("signal SIGTERM: %w", err))
+		}
 	}
 	t := time.NewTimer(gracePeriod)
 	defer t.Stop()
@@ -342,12 +347,15 @@ func (w *pythonSubprocessWorker) Shutdown() {
 	case <-w.done:
 	case <-t.C:
 		if cmd != nil && cmd.Process != nil {
-			_ = cmd.Process.Kill()
+			if err := cmd.Process.Kill(); err != nil {
+				errs = append(errs, fmt.Errorf("kill process: %w", err))
+			}
 		}
 	}
 	if cancel != nil {
 		cancel()
 	}
+	return errors.Join(errs...)
 }
 
 // errLineTooLong is returned by readBoundedLine when a single newline-delimited

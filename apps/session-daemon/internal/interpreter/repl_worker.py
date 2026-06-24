@@ -77,7 +77,9 @@ def _shrink_frame(chunk: dict) -> dict:
     returns the same dict.
     """
     marker = "…[output truncated: frame exceeded line limit]"
-    for key in ("text", "value", "traceback"):
+    # `name` is user-controlled (e.g. type(e).__name__), so a pathological
+    # exception class name must not survive into the shrunk frame.
+    for key in ("text", "value", "traceback", "name"):
         if isinstance(chunk.get(key), str):
             chunk[key] = marker
     if isinstance(chunk.get("data"), dict):
@@ -128,6 +130,18 @@ class REPLWorker:
             # unreachable for well-behaved output.
             if len(line.encode("utf-8")) > MAX_LINE_BYTES:
                 line = json.dumps(_shrink_frame(chunk))
+                # _shrink_frame only drops the known bulky fields; a frame with
+                # other large fields could still exceed the cap. Re-check and, if
+                # still oversized, fall back to a minimal control frame that
+                # preserves only the routing fields so the emitted line is always
+                # under the reader cap.
+                if len(line.encode("utf-8")) > MAX_LINE_BYTES:
+                    line = json.dumps(
+                        {
+                            "type": chunk.get("type", "control"),
+                            "text": "…[output truncated: frame exceeded line limit]",
+                        }
+                    )
             sys.__stdout__.write(line)
             sys.__stdout__.write("\n")
             sys.__stdout__.flush()

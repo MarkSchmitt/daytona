@@ -127,6 +127,7 @@ func (m *Manager) CreateSession(req CreateSessionRequest) (*Session, error) {
 			LastUsedAt: now,
 			Active:     true,
 		},
+		logger: m.logger,
 	}
 
 	worker, err := factory.Create(req.ID, req, c.handleChunk)

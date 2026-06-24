@@ -66,6 +66,9 @@ function shrinkFrame(chunk) {
   if (typeof chunk.text === 'string') chunk.text = marker
   if (typeof chunk.value === 'string') chunk.value = marker
   if (typeof chunk.traceback === 'string') chunk.traceback = marker
+  // `name` is user-controlled (e.g. an exception's constructor name), so a
+  // pathological value must not survive into the shrunk frame.
+  if (typeof chunk.name === 'string') chunk.name = marker
   if (chunk.data && typeof chunk.data === 'object') {
     for (const mime of Object.keys(chunk.data)) chunk.data[mime] = marker
   }
@@ -109,6 +112,18 @@ function emit(chunk) {
       // and the host's drain-and-skip oversized-line recovery stays unreachable.
       if (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES) {
         line = JSON.stringify(shrinkFrame(chunk))
+        // shrinkFrame only drops the known bulky fields (text/value/traceback/
+        // name/data); a frame with other large fields (e.g. `packages` from
+        // list-packages) could still exceed the cap. Re-check and, if still
+        // oversized, fall back to a minimal control frame that preserves only
+        // the routing fields so the emitted line is always under the reader cap.
+        if (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES) {
+          line = JSON.stringify({
+            sessionId: chunk.sessionId || '',
+            type: chunk.type || 'control',
+            text: '…[output truncated: frame exceeded line limit]',
+          })
+        }
       }
       process.stdout.write(line + '\n')
     } catch (e) {
