@@ -38,8 +38,8 @@ func TestSessionListTemplates(t *testing.T) {
 	require.NotNil(t, pythonDefault, "templates must include python-default")
 
 	languages, _ := pythonDefault["languages"].([]interface{})
-	assert.ElementsMatch(t, []interface{}{"python", "typescript"}, languages,
-		"python-default must support both python and typescript")
+	assert.ElementsMatch(t, []interface{}{"python", "typescript", "bash"}, languages,
+		"python-default must support python, typescript, and bash")
 
 	packages, _ := pythonDefault["packages"].([]interface{})
 	assert.NotEmpty(t, packages, "python-default must declare a non-empty packages[]")

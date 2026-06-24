@@ -18,8 +18,6 @@ import (
 // TestSessionBashEcho proves the standalone bash isolate runs a virtual-bash
 // pipeline (grep is reimplemented by just-bash; no real binary/subprocess).
 func TestSessionBashEcho(t *testing.T) {
-	t.Skipf("not yet implemented: session-daemon-bash-host")
-
 	cfg := LoadConfig(t)
 	api := NewAPIClient(cfg)
 	ic := NewSessionClient(api)
@@ -37,8 +35,6 @@ func TestSessionBashEcho(t *testing.T) {
 // raised as a transport error) — the standalone isolate surfaces the exit via
 // the normal completion flow.
 func TestSessionBashNonZeroExit(t *testing.T) {
-	t.Skipf("not yet implemented: session-daemon-bash-host")
-
 	cfg := LoadConfig(t)
 	api := NewAPIClient(cfg)
 	ic := NewSessionClient(api)
@@ -54,8 +50,6 @@ func TestSessionBashNonZeroExit(t *testing.T) {
 // written in one bash session is NOT visible to a second session (each gets its
 // own OverlayFs over /workspace).
 func TestSessionBashOverlayIsolation(t *testing.T) {
-	t.Skipf("not yet implemented: session-daemon-bash-host")
-
 	cfg := LoadConfig(t)
 	api := NewAPIClient(cfg)
 	ic := NewSessionClient(api)
@@ -87,8 +81,6 @@ func TestSessionBashOverlayIsolation(t *testing.T) {
 // TestSessionPythonBashBridge proves Python user code can call bash() and read
 // the result back (the stdio hostcall RPC bridge).
 func TestSessionPythonBashBridge(t *testing.T) {
-	t.Skipf("not yet implemented: session-daemon-bash-host")
-
 	cfg := LoadConfig(t)
 	api := NewAPIClient(cfg)
 	ic := NewSessionClient(api)
@@ -112,8 +104,6 @@ func TestSessionPythonBashBridge(t *testing.T) {
 // host-bridged bash() (just-bash runs in the host, results copied across the
 // isolated-vm boundary).
 func TestSessionTypescriptBashBridge(t *testing.T) {
-	t.Skipf("not yet implemented: session-daemon-bash-host")
-
 	cfg := LoadConfig(t)
 	api := NewAPIClient(cfg)
 	ic := NewSessionClient(api)
