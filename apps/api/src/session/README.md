@@ -19,3 +19,12 @@ The pool autoscales from one warm sandbox per `(org, template)` to a hybrid-auto
 distributes concurrent load and provisions/reaps sandboxes on demand. See
 [docs/scale-out.md](./docs/scale-out.md) for the full design: request routing & stickiness, the load
 model, cgroup/PSI methodology, the autoscale algorithm, the config reference, and the ops runbook.
+
+## Bash (isolated) executions
+
+A feasibility/design investigation into running isolated bash executions — where the hard part is
+isolating concurrent contexts that share one scale-out sandbox. See
+[docs/bash-isolation.md](./docs/bash-isolation.md) for the threat model (intra-org blast-radius vs.
+the privileged-container boundary), where a bash worker plugs into the daemon, the isolation options
+(process group, cgroups, namespaces, overlay, dedicated sandbox, virtual interpreter), a survey of
+existing solutions (`just-bash`, bashkit, E2B, Modal, microsandbox), and a tiered recommendation.
