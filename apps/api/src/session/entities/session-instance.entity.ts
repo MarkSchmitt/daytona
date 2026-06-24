@@ -11,6 +11,7 @@ import {
   JoinColumn,
   ManyToOne,
   PrimaryGeneratedColumn,
+  Unique,
   UpdateDateColumn,
 } from 'typeorm'
 import { SessionTemplate } from './session-template.entity'
@@ -32,6 +33,9 @@ import { SessionInstanceRole } from '../enums/session-instance-role.enum'
  * can detect drift (instance.snapshotId != template.snapshotId) without an extra join.
  */
 @Entity('session_instance')
+// Unique target for the composite tenant-consistency FK from `session` (see Session.instance);
+// mirrors the DB constraint UQ_session_instance_org_id (id is PK, so the pair is trivially unique).
+@Unique('UQ_session_instance_org_id', ['organizationId', 'id'])
 @Index('session_instance_org_template_state_idx', ['organizationId', 'templateId', 'state'])
 @Index('session_instance_state_idx', ['state'])
 @Index('session_instance_sandbox_idx', ['sandboxId'])

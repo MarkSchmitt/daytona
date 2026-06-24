@@ -30,8 +30,15 @@ export class Session {
   @Column({ type: 'uuid' })
   instanceId: string
 
+  // Composite join (organizationId + instanceId) mirrors the DB-level tenant-consistency FK
+  // (FK_session_org_instance → session_instance(organizationId, id)), so a session can only
+  // reference an instance in the same org. Kept in sync with the entity metadata so
+  // `migration:generate` does not revert it to a single-column FK.
   @ManyToOne(() => SessionInstance, { eager: false, onDelete: 'CASCADE' })
-  @JoinColumn({ name: 'instanceId' })
+  @JoinColumn([
+    { name: 'organizationId', referencedColumnName: 'organizationId' },
+    { name: 'instanceId', referencedColumnName: 'id' },
+  ])
   instance?: SessionInstance
 
   @Column()

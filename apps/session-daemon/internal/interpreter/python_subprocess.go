@@ -330,14 +330,17 @@ func (w *pythonSubprocessWorker) Shutdown() error {
 	cancel := w.cancel
 	w.mu.Unlock()
 
+	// Teardown is best-effort: the process/pipe may already be gone, which surfaces
+	// as benign races (os.ErrProcessDone, os.ErrClosed). Only collect genuine errors
+	// so callers don't log noise on every normal shutdown.
 	var errs []error
 	if stdin != nil {
-		if err := stdin.Close(); err != nil {
+		if err := stdin.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 			errs = append(errs, fmt.Errorf("close stdin: %w", err))
 		}
 	}
 	if cmd != nil && cmd.Process != nil {
-		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			errs = append(errs, fmt.Errorf("signal SIGTERM: %w", err))
 		}
 	}
@@ -347,7 +350,7 @@ func (w *pythonSubprocessWorker) Shutdown() error {
 	case <-w.done:
 	case <-t.C:
 		if cmd != nil && cmd.Process != nil {
-			if err := cmd.Process.Kill(); err != nil {
+			if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 				errs = append(errs, fmt.Errorf("kill process: %w", err))
 			}
 		}
