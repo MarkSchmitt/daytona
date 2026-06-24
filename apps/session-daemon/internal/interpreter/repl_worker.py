@@ -24,6 +24,7 @@ import os
 import signal
 import sys
 import traceback
+import uuid
 from contextlib import redirect_stderr, redirect_stdout
 
 # Configure matplotlib up-front so the Agg backend is selected before any
@@ -94,16 +95,18 @@ class REPLWorker:
         self._setup_signals()
         self._patch_pyplot_show()
 
-    @staticmethod
-    def _fresh_globals() -> dict:
+    def _fresh_globals(self) -> dict:
         # The trio of dunders + __builtins__ is what `exec()` expects to find
         # in the globals dict; rebuilding from scratch gives transient-context
         # callers true one-shot semantics without re-spawning the interpreter.
+        # `bash` is injected as a builtin so user code can shell out to the
+        # daemon's virtual just-bash shell (see _bash / the hostcall bridge).
         return {
             "__name__": "__main__",
             "__doc__": None,
             "__package__": None,
             "__builtins__": __builtins__,
+            "bash": self._bash,
         }
 
     # ---------- IO ----------
@@ -184,6 +187,50 @@ class REPLWorker:
         def close(self) -> None:  # type: ignore[override]
             self.flush()
             return super().close()
+
+    # ---------- bash() bridge ----------
+    def _bash(self, cmd, env=None) -> "BashResult":
+        """Run a command in the daemon's virtual just-bash shell.
+
+        Emits a hostcall frame on stdout and blocks reading stdin for the
+        correlated result. This is safe because the daemon never interleaves a
+        new exec command while one is in flight, so during a bash() call stdin
+        carries only this call's reply. Raises RuntimeError if the bridge is
+        unavailable or the command could not be dispatched; a non-zero command
+        exit is NOT an error — inspect the returned exit_code.
+        """
+        call_id = uuid.uuid4().hex
+        payload = {"type": "hostcall", "id": call_id, "method": "bash", "cmd": str(cmd)}
+        if env:
+            payload["env"] = {str(k): str(v) for k, v in env.items()}
+        # Write directly (not via _emit, which truncates text fields) so the
+        # command and correlation id are never mangled.
+        sys.__stdout__.write(json.dumps(payload))
+        sys.__stdout__.write("\n")
+        sys.__stdout__.flush()
+
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                raise RuntimeError("bash bridge: connection closed by daemon")
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(msg, dict) or msg.get("id") != call_id:
+                continue
+            mtype = msg.get("type")
+            if mtype == "hostcall_error":
+                raise RuntimeError("bash: " + str(msg.get("message", "bridge error")))
+            if mtype == "hostcall_result":
+                return BashResult(
+                    str(msg.get("stdout", "")),
+                    str(msg.get("stderr", "")),
+                    int(msg.get("exitCode", 0)),
+                )
 
     # ---------- Signals ----------
     def _setup_signals(self) -> None:
@@ -337,6 +384,11 @@ class REPLWorker:
     def handle_command(self, line: str) -> None:
         try:
             msg = json.loads(line)
+            # A bash() hostcall reply can land in the main loop if the exec that
+            # issued it was interrupted before consuming it. It's not a command —
+            # discard it rather than running it as empty code.
+            if isinstance(msg, dict) and str(msg.get("type", "")).startswith("hostcall"):
+                return
             envs = msg.get("envs")
             if envs is not None and not isinstance(envs, dict):
                 raise ValueError("envs must be an object")
@@ -362,6 +414,24 @@ class REPLWorker:
             except Exception as e:  # noqa: BLE001
                 sys.__stderr__.write(f"Fatal error in main loop: {e}\n")
                 break
+
+
+class BashResult:
+    """Result of a bash() bridge call: captured stdout/stderr and the exit code.
+
+    repr() is kept compact so a trailing `bash(...)` expression in a cell renders
+    a readable one-liner via the daemon's display hook.
+    """
+
+    __slots__ = ("stdout", "stderr", "exit_code")
+
+    def __init__(self, stdout: str, stderr: str, exit_code: int) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.exit_code = exit_code
+
+    def __repr__(self) -> str:
+        return f"BashResult(exit_code={self.exit_code}, stdout={self.stdout!r}, stderr={self.stderr!r})"
 
 
 def _exec_with_last_expr(code: str, globals_dict: dict):

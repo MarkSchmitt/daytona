@@ -150,7 +150,40 @@ try {
   process.exit(1)
 }
 
+// just-bash backs the in-isolate bash() bridge. It is OPTIONAL: unlike
+// isolated-vm/esbuild we do NOT exit on failure — TS sessions still run, and
+// user code that calls bash() gets a clear "bash runtime unavailable" error.
+// just-bash is "type":"module" but ships a CommonJS condition, so require()
+// resolves it; OverlayFs is re-exported from the package root.
+let Bash = null
+let OverlayFs = null
+try {
+  // eslint-disable-next-line global-require
+  const jb = require('just-bash')
+  if (typeof jb.Bash === 'function' && typeof jb.OverlayFs === 'function') {
+    Bash = jb.Bash
+    OverlayFs = jb.OverlayFs
+  }
+} catch (_err) {
+  // bash() bridge stays unavailable; logged lazily on first use.
+}
+
 const USER_NODE_MODULES_ROOT = process.env.SESSION_DAEMON_USER_NODE_MODULES_ROOT || '/workspace'
+
+// Workspace root the in-isolate bash() bridge overlays (reads hit the real
+// /workspace, writes stay private + in-memory per isolate). It is the same
+// path the module resolver roots at.
+const BASH_WORKSPACE_ROOT = process.env.SESSION_DAEMON_WORKSPACE_ROOT || USER_NODE_MODULES_ROOT
+
+// Per-call wall-clock ceiling for bash() so a heavy/looping command can't stall
+// the shared TS host event loop. Mirrors the bash host's own guard.
+const BASH_CALL_TIMEOUT_MS = (() => {
+  const n = parseInt(process.env.SESSION_DAEMON_BASH_EXEC_TIMEOUT_MS || '', 10)
+  return Number.isFinite(n) && n > 0 ? n : 30000
+})()
+
+// just-bash execution-protection limits (runaway loops / deep recursion).
+const BASH_EXECUTION_LIMITS = { maxCallDepth: 100, maxCommandCount: 100000, maxLoopIterations: 1000000 }
 
 // One Map<sessionId, ContextRecord>.
 const contexts = new Map()
@@ -171,6 +204,24 @@ class ContextRecord {
     // sessions, so this cache lives on the ContextRecord (not in bundleCache,
     // which is the host-global source-string cache).
     this.modules = new Map()
+    // Per-isolate just-bash instance backing the bash() bridge. Created lazily
+    // on first bash() call and dropped on reset/dispose. Each isolate gets its
+    // own OverlayFs so writes are private to that isolate and discarded on
+    // teardown — same isolation posture as the standalone bash isolate.
+    this.bash = null
+  }
+
+  // Lazily construct this isolate's bash shell. Throws if just-bash is
+  // unavailable so the bridge surfaces a clear error to user code.
+  #ensureBash() {
+    if (!Bash || !OverlayFs) {
+      throw makeError('BashUnavailableError', 'bash runtime unavailable')
+    }
+    if (!this.bash) {
+      const overlay = new OverlayFs({ root: BASH_WORKSPACE_ROOT, mountPoint: BASH_WORKSPACE_ROOT })
+      this.bash = new Bash({ fs: overlay, cwd: overlay.getMountPoint(), executionLimits: BASH_EXECUTION_LIMITS })
+    }
+    return this.bash
   }
 
   async #bootContext() {
@@ -198,6 +249,29 @@ class ContextRecord {
         }).copyInto({ release: true })
       } catch (e) {
         return new ivm.ExternalCopy({ __error: true, message: e.message, name: e.name }).copyInto({ release: true })
+      }
+    }))
+
+    // Bash bridge (host-side just-bash; session shells out to virtual bash
+    // tooling). just-bash runs in the host JS engine, NOT inside the isolate
+    // (isolated-vm has no Node), so we expose it via this Reference exactly like
+    // the fetch bridge: only strings cross the boundary, and each isolate has
+    // its own OverlayFs over /workspace (private, in-memory writes).
+    await jail.set('_bash', new ivm.Reference(async (cmd, envStr) => {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), BASH_CALL_TIMEOUT_MS)
+      try {
+        const env = envStr ? JSON.parse(envStr) : undefined
+        const r = await this.#ensureBash().exec(String(cmd), { env, signal: controller.signal })
+        return new ivm.ExternalCopy({
+          stdout: r.stdout || '',
+          stderr: r.stderr || '',
+          exitCode: typeof r.exitCode === 'number' ? r.exitCode : 0,
+        }).copyInto({ release: true })
+      } catch (e) {
+        return new ivm.ExternalCopy({ __error: true, message: e.message, name: e.name }).copyInto({ release: true })
+      } finally {
+        clearTimeout(timer)
       }
     }))
 
@@ -316,6 +390,18 @@ class ContextRecord {
           arrayBuffer: async () => new TextEncoder().encode(res.text).buffer,
         };
       };
+      // bash(command[, env]) runs a command in this isolate's virtual just-bash
+      // shell and resolves to { stdout, stderr, exitCode }. A non-zero exitCode
+      // is NOT thrown — only a bridge/runtime failure rejects.
+      const bash = async (command, env) => {
+        const envStr = env ? JSON.stringify(env) : undefined;
+        const res = await _bash.apply(undefined, [String(command), envStr], { result: { promise: true, copy: true } });
+        if (res && res.__error) {
+          throw new Error(res.message || 'bash failed');
+        }
+        return res;
+      };
+      globalThis.bash = bash;
       // env is exposed as a mutable plain global, populated per-call by the host
       // via ctx.global.set('env', ...). It cannot be declared with 'const' here
       // — that creates a lexical binding the host cannot override at exec time,
@@ -349,6 +435,10 @@ class ContextRecord {
           // and leak host-side handles. See dispose() for the same teardown.
           this.#clearAllTimers()
           this.modules = new Map()
+          // Drop the bash shell so the recycled context starts with a pristine
+          // overlay (prior writes are discarded), matching the fresh-globals
+          // semantics of a reset.
+          this.bash = null
           this.contextPromise = this.#bootContext()
         }
         ctx = await this.contextPromise
@@ -537,6 +627,8 @@ class ContextRecord {
     // we just drop our references. Explicit module.release() is unnecessary
     // because session.dispose() reclaims everything in one shot.
     this.modules.clear()
+    // Drop the per-isolate bash shell + its overlay (in-memory writes discarded).
+    this.bash = null
     try { this.isolate.dispose() } catch (_e) {/* already disposed */}
   }
 }

@@ -22,9 +22,11 @@ model, cgroup/PSI methodology, the autoscale algorithm, the config reference, an
 
 ## Bash (isolated) executions
 
-A feasibility/design investigation into running isolated bash executions — where the hard part is
-isolating concurrent contexts that share one scale-out sandbox. See
-[docs/bash-isolation.md](./docs/bash-isolation.md) for the threat model (intra-org blast-radius vs.
-the privileged-container boundary), where a bash worker plugs into the daemon, the isolation options
-(process group, cgroups, namespaces, overlay, dedicated sandbox, virtual interpreter), a survey of
-existing solutions (`just-bash`, bashkit, E2B, Modal, microsandbox), and a tiered recommendation.
+`bash` is a first-class session language, run as a **`just-bash` virtual-interpreter isolate**: each
+session is an in-process bash (grep/sed/awk/jq/pipes, no real binaries) over an OverlayFs that reads
+the real `/workspace` but keeps writes private + ephemeral per isolate. Python and TypeScript isolates
+can also shell out via a `bash()` builtin (in-process bridge for TS, stdio-RPC bridge for Python).
+See [docs/bash-isolation.md](./docs/bash-isolation.md) for the full story: the threat model and the
+two isolation modes (one sandbox per principal vs. shared-sandbox isolates), the survey of
+alternatives (`just-bash`, bashkit, E2B, Modal, microsandbox), and **§9 for the implemented design**
+(engine, daemon wiring, both bridges, and tests).

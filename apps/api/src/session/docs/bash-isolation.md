@@ -3,9 +3,12 @@
 Can the session product safely run **isolated bash executions**, where the hard part is isolating
 concurrent contexts that share one scale-out sandbox?
 
-This document is a feasibility/design analysis — **no code has been written yet**. It is the
-companion investigation to [scale-out.md](./scale-out.md) and the implementation surfaces it
-references live in `apps/session-daemon/internal/` and `apps/api/src/session/`.
+This document began as a feasibility/design analysis. **§1–§8 are that original analysis** (kept as
+the decision record); **§9 documents what was actually implemented in v1** — the `just-bash` isolate
+engine plus the in-isolate (TypeScript) and stdio-RPC (Python) `bash()` bridges. If you only want to
+know how bash works today, jump to [§9](#9-implemented-design-v1--just-bash-isolate--bash-bridges).
+It is the companion investigation to [scale-out.md](./scale-out.md) and the implementation surfaces
+it references live in `apps/session-daemon/internal/` and `apps/api/src/session/`.
 
 ## 1. Verdict (TL;DR)
 
@@ -288,3 +291,72 @@ change that also shifts Daytona off its current container-tier isolation model.
   context's cgroup and does not take down siblings or the daemon.
 - **Parity / regression:** existing `TestSession*` specs stay green; bash contexts participate
   correctly in the scale-out scheduler (counted in busy/active, respect `BashMaxContexts`).
+
+## 9. Implemented design (v1) — `just-bash` isolate + `bash()` bridges
+
+v1 ships **option G** (the virtual-interpreter path) as the bash isolate engine, deliberately
+**not** the Tier 0/1 OS-namespace path of §5–§6. The reasoning that won: the product's two isolation
+modes are (a) **strong isolation = one sandbox per principal** (the container boundary, proven via
+the sysbox runtime — see §2/option F), and (b) **process isolation = many lightweight isolates in
+one shared sandbox**, trading the strong boundary for throughput. Python (subprocess) and TypeScript
+(V8/`isolated-vm`) already cover (b) for code; bash needed an isolate of the same shape. A real
+`bash` subprocess would reintroduce every shared-FS/PID/port problem §4 enumerates, whereas a virtual
+interpreter gives **inter-isolate isolation by construction** with near-zero startup. Users who need
+real binaries choose mode (a); users who need cheap, safe shell tooling choose this.
+
+### 9.1 Engine: `just-bash` over an OverlayFs
+
+Each bash session is one `just-bash` `Bash` instance (pinned `just-bash@3.0.2`, bundled into the
+host image — see `apps/session-daemon/Dockerfile` / `snapshot.Dockerfile`, not `//go:embed`). It
+reimplements grep/sed/awk/jq/find/pipes/etc. in-process — **no `fork`/`exec`, no real binaries**.
+
+- **Filesystem:** `OverlayFs({ root: /workspace, mountPoint: /workspace })`. Reads hit the **real**
+  `/workspace`; writes are **private and in-memory per isolate** and discarded on teardown (and on a
+  `reset`, matching the fresh-globals semantics of the Python/TS isolates). This is the per-isolate FS
+  boundary §4 asks for, without a mount namespace.
+- **Network:** off. `network`/`fetch` are not configured, so `curl`/`wget` have no egress.
+- **Runtimes:** `python`/`javascript` (CPython/QuickJS) are left disabled — bash tooling only.
+- **Execution limits:** `maxCallDepth` / `maxCommandCount` / `maxLoopIterations` (tunable via
+  `SESSION_DAEMON_BASH_*` env) guard runaway loops/recursion, plus an `AbortController` per call wired
+  to the daemon's existing timeout → interrupt path.
+
+### 9.2 Daemon wiring
+
+A `BashFactory` (`bash_host.go`) mirrors `TSFactory`: one long-lived Node "bash host"
+(`repl_bash_host.js`) per daemon multiplexes many per-session shells over the same stdin/stdout
+JSON-line `WorkerChunk` protocol (create-ack, `readBoundedLine` framing, host-exit listener
+synthesis — all shared with the TS host). Wiring points:
+
+- `LanguageBash` (`"bash"`, alias `"sh"`) in `types.go` / `normalizeLanguage`.
+- `Manager.factoryFor` routes bash; `BashMaxContexts` caps it in `config.go` /
+  `checkCapacityLocked`; `LoadCounts` reports `bashMax` to `/load`.
+- `SessionLanguage.BASH` in `apps/api/src/session/enums/session-language.enum.ts` (+ `SESSION_LANGUAGES`),
+  so templates can list bash and `codeRun`/`connect` route to it with no shape change.
+
+The **standalone bash isolate** uses the streaming `exec` op (stdout/stderr chunks then a terminal
+`completed`/`interrupted`), exactly like a Python/TS context.
+
+### 9.3 `bash()` from inside TypeScript and Python isolates
+
+Both code isolates can shell out to the virtual bash tooling, returning `{ stdout, stderr, exitCode }`
+(a non-zero exit is **not** thrown — only a bridge/runtime failure rejects):
+
+- **TypeScript (in-process bridge):** `just-bash` runs in the TS host's Node engine (it cannot run
+  inside `isolated-vm`, which has no Node). `repl_host.js` exposes a `_bash` `ivm.Reference` and a
+  user-facing `bash(cmd[, env])`; only strings cross the isolate boundary (same pattern as the
+  `fetch` shim). Each isolate gets its **own** OverlayFs, dropped on reset/dispose.
+- **Python (stdio-RPC bridge):** the Python worker has no host-side handle, so `bash()` emits a
+  `{"type":"hostcall",...}` frame on stdout; the daemon (`python_subprocess.go`) routes it to the
+  **shared** `BashFactory` host via the `BashInvoker` interface and writes a correlated
+  `hostcall_result` back to the worker's stdin. Per-session overlay state is keyed by the context id
+  and released on shutdown. The hostcall is serviced off the read loop so a slow command can't delay
+  interrupt processing, and a stray reply after an interrupt is discarded.
+
+### 9.4 Tests
+
+- **Daemon unit (runtime-free, normal CI):** `internal/interpreter/bash_test.go` — `normalizeLanguage`
+  bash/sh, `factoryFor`/capacity routing, `LoadCounts` bashMax, and the bridge wire shapes
+  (`hostCall`/`hostCallResult`, bash-call `WorkerChunk` fields).
+- **E2E (`//go:build e2e`):** `apps/daytona-e2e/sessions_bash_test.go` — direct bash (`grep` over a
+  pipe, non-zero exit, overlay isolation between sessions), `bash()` from Python, and `bash()` from
+  TypeScript.

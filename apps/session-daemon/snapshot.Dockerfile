@@ -74,14 +74,16 @@ RUN mkdir -p /workspace && cd /workspace \
         marked@15.0.6 openai@4.77.3 @anthropic-ai/sdk@0.33.1 \
     && rm -rf /root/.npm
 
-# Host-side bundle dependencies (isolated-vm, esbuild-wasm). isolated-vm has
-# native bindings compiled against this image's Node version at install time;
-# baking it into the image (rather than runtime install) is what makes
-# cold-start fast. Per plan §1, the daemon's //go:embed only carries the entry
-# script — heavy deps live in the image layer. Pinned to exact patch versions.
+# Host-side bundle dependencies (isolated-vm, esbuild-wasm, just-bash).
+# isolated-vm has native bindings compiled against this image's Node version at
+# install time; baking it into the image (rather than runtime install) is what
+# makes cold-start fast. just-bash is the pure-JS virtual-bash engine backing
+# the bash isolate + the in-isolate/Python bash() bridges (no native bindings,
+# no real subprocesses). Per plan §1, the daemon's //go:embed only carries the
+# entry scripts — heavy deps live in the image layer. Pinned to exact versions.
 RUN mkdir -p /usr/lib/daytona/repl_host && cd /usr/lib/daytona/repl_host \
     && npm init -y >/dev/null \
-    && npm install --omit=optional --omit=peer isolated-vm@5.0.3 esbuild-wasm@0.24.2 \
+    && npm install --omit=optional --omit=peer isolated-vm@5.0.3 esbuild-wasm@0.24.2 just-bash@3.0.2 \
     && rm -rf /root/.npm
 
 # Fetch the daemon binary the caller pre-built. The URL scheme is enforced as
