@@ -5,35 +5,36 @@
 
 import { Injectable, Logger } from '@nestjs/common'
 import { Cron, CronExpression } from '@nestjs/schedule'
-import { InjectRepository } from '@nestjs/typeorm'
-import { Repository } from 'typeorm'
 import { InjectRedis } from '@nestjs-modules/ioredis'
 import Redis from 'ioredis'
-import { Session } from '../entities/session.entity'
 import { SessionState } from '../enums/session-state.enum'
 import { TypedConfigService } from '../../config/typed-config.service'
+import { sessionKeys } from './session-repository.service'
+
+/** Minimal view of a stored context blob the GC needs to clean up secondary indexes. */
+interface GcContext {
+  orgId: string
+  instanceId: string
+  state: SessionState
+}
 
 /**
- * SessionGcService enforces idle and absolute TTLs on contexts.
+ * SessionGcService enforces idle and absolute TTLs on Redis-backed contexts.
  *
- * Both crons are hardcoded at @Cron(EVERY_MINUTE):
- *  - sweepExpired() marks ACTIVE contexts that have idled out / absolutely aged out as EXPIRED.
- *  - hardDeleteExpired() permanently removes EXPIRED/INVALID rows older than the grace period.
+ *  - sweepExpired() flips ACTIVE contexts whose expiry deadline has passed to EXPIRED. Candidates
+ *    come from the `session:gc:expiry` zset (scored by the computed expiresAt, refreshed on every
+ *    lastUsedAt touch), so a single ZRANGEBYSCORE up to `now` yields exactly the due contexts.
+ *  - hardDeleteExpired() permanently removes EXPIRED/INVALID contexts past the grace period, taken
+ *    from the `session:gc:grace` zset (scored by the grace deadline).
  *
- * Hard-delete runs every minute (not hourly) so e2e tests with overridden grace periods can
- * complete in seconds rather than waiting an hour. Steady-state cost is one indexed DELETE
- * LIMIT 500 per minute on a small table — negligible.
- *
- * TTL knobs are re-read from process.env on every tick (not at boot) so tests can flip them
- * without an API restart.
+ * Both crons run @EVERY_MINUTE; the grace zset preserves the 410 (expired/invalidated, with
+ * reason) contract during the grace window. TTL knobs are re-read from process.env on every tick.
  */
 @Injectable()
 export class SessionGcService {
   private readonly logger = new Logger(SessionGcService.name)
 
   constructor(
-    @InjectRepository(Session)
-    private readonly repo: Repository<Session>,
     @InjectRedis()
     private readonly redis: Redis,
     private readonly config: TypedConfigService,
@@ -41,96 +42,104 @@ export class SessionGcService {
 
   @Cron(CronExpression.EVERY_MINUTE, { name: 'session-gc-sweep' })
   async sweepExpired(): Promise<void> {
-    const idleTtlSec = this.intEnv(
-      'SESSION_IDLE_TTL_SECONDS',
-      this.config.get('session.context.idleTtlSeconds') ?? 3600,
-    )
-    const absTtlSec = this.intEnv(
-      'SESSION_ABSOLUTE_TTL_SECONDS',
-      this.config.get('session.context.absoluteTtlSeconds') ?? 604800,
-    )
     const batch = this.config.get('session.context.gcBatchSize') ?? 500
-
-    let updatedRows: { id: string; instanceId: string }[] = []
-    try {
-      const result = await this.repo
-        .createQueryBuilder()
-        .update(Session)
-        .set({ state: SessionState.EXPIRED, expiredAt: () => 'NOW()' })
-        .where(
-          `id IN (
-             SELECT id FROM session
-             WHERE state = :active
-               AND ("lastUsedAt" < NOW() - (:idle * INTERVAL '1 second')
-                    OR "createdAt" < NOW() - (:abs * INTERVAL '1 second'))
-             LIMIT :batch
-           )`,
-          {
-            active: SessionState.ACTIVE,
-            idle: idleTtlSec,
-            abs: absTtlSec,
-            batch,
-          },
-        )
-        .returning(['id', 'instanceId'])
-        .execute()
-      updatedRows = (result.raw as { id: string; instanceId: string }[] | undefined) ?? []
-    } catch (err) {
-      this.logger.error(`sweepExpired query failed: ${err.message}`)
-      return
-    }
-
-    if (updatedRows.length === 0) return
-    this.logger.debug(`sweepExpired: marked ${updatedRows.length} contexts EXPIRED`)
-
-    // Best-effort Redis cleanup. Daemon-side DELETE /sessions is fired by the SessionService
-    // path on next access — we don't tunnel it from here to keep the GC PG-only.
-    try {
-      const pipe = this.redis.pipeline()
-      for (const row of updatedRows) {
-        pipe.del(`session:${row.id}`)
-        pipe.srem(`session:instance:${row.instanceId}:sessions`, row.id)
-      }
-      await pipe.exec()
-    } catch (err) {
-      this.logger.warn(`sweepExpired cache cleanup failed: ${err.message}`)
-    }
-  }
-
-  @Cron(CronExpression.EVERY_MINUTE, { name: 'session-gc-hard-delete' })
-  async hardDeleteExpired(): Promise<void> {
+    const now = Date.now()
     const graceSec = this.intEnv(
       'SESSION_EXPIRED_GRACE_SECONDS',
       this.config.get('session.context.expiredGracePeriodSeconds') ?? 86400,
     )
-    const batch = this.config.get('session.context.gcBatchSize') ?? 500
-    const cutoff = new Date(Date.now() - graceSec * 1000)
+    const graceDeadline = now + graceSec * 1000
+
+    let ids: string[]
+    try {
+      ids = await this.redis.zrangebyscore(sessionKeys.gcExpiry, '-inf', now, 'LIMIT', 0, batch)
+    } catch (err) {
+      this.logger.error(`sweepExpired candidate scan failed: ${err.message}`)
+      return
+    }
+    if (ids.length === 0) return
+
+    let raws: (string | null)[]
+    try {
+      raws = await this.redis.mget(ids.map((id) => sessionKeys.ctx(id)))
+    } catch (err) {
+      this.logger.error(`sweepExpired blob read failed: ${err.message}`)
+      return
+    }
+
+    const pipe = this.redis.pipeline()
+    let expired = 0
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i]
+      const raw = raws[i]
+      // Blob gone or no longer ACTIVE — just drop the stale expiry-index entry.
+      if (!raw) {
+        pipe.zrem(sessionKeys.gcExpiry, id)
+        continue
+      }
+      const blob = JSON.parse(raw) as GcContext & Record<string, unknown>
+      if (blob.state !== SessionState.ACTIVE) {
+        pipe.zrem(sessionKeys.gcExpiry, id)
+        continue
+      }
+      blob.state = SessionState.EXPIRED
+      blob.expiredAt = new Date(now).toISOString()
+      pipe.set(sessionKeys.ctx(id), JSON.stringify(blob))
+      pipe.zrem(sessionKeys.orgIndex(blob.orgId), id)
+      pipe.zrem(sessionKeys.gcExpiry, id)
+      pipe.zadd(sessionKeys.gcGrace, graceDeadline, id)
+      expired++
+    }
 
     try {
-      const expired = await this.repo
-        .createQueryBuilder()
-        .delete()
-        .from(Session)
-        .where(
-          `id IN (
-             SELECT id FROM session
-             WHERE (state = :expired AND "expiredAt" < :cutoff)
-                OR (state = :invalid AND "invalidatedAt" < :cutoff)
-             LIMIT :batch
-           )`,
-          {
-            expired: SessionState.EXPIRED,
-            invalid: SessionState.INVALID,
-            cutoff,
-            batch,
-          },
-        )
-        .execute()
-      if (expired.affected) {
-        this.logger.debug(`hardDeleteExpired: removed ${expired.affected} rows`)
-      }
+      await pipe.exec()
     } catch (err) {
-      this.logger.error(`hardDeleteExpired failed: ${err.message}`)
+      this.logger.error(`sweepExpired pipeline failed: ${err.message}`)
+      return
+    }
+    if (expired > 0) this.logger.debug(`sweepExpired: marked ${expired} contexts EXPIRED`)
+  }
+
+  @Cron(CronExpression.EVERY_MINUTE, { name: 'session-gc-hard-delete' })
+  async hardDeleteExpired(): Promise<void> {
+    const batch = this.config.get('session.context.gcBatchSize') ?? 500
+    const now = Date.now()
+
+    let ids: string[]
+    try {
+      ids = await this.redis.zrangebyscore(sessionKeys.gcGrace, '-inf', now, 'LIMIT', 0, batch)
+    } catch (err) {
+      this.logger.error(`hardDeleteExpired candidate scan failed: ${err.message}`)
+      return
+    }
+    if (ids.length === 0) return
+
+    let raws: (string | null)[]
+    try {
+      raws = await this.redis.mget(ids.map((id) => sessionKeys.ctx(id)))
+    } catch (err) {
+      this.logger.error(`hardDeleteExpired blob read failed: ${err.message}`)
+      return
+    }
+
+    const pipe = this.redis.pipeline()
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i]
+      const raw = raws[i]
+      pipe.del(sessionKeys.ctx(id))
+      pipe.zrem(sessionKeys.gcGrace, id)
+      if (raw) {
+        const blob = JSON.parse(raw) as GcContext
+        pipe.srem(sessionKeys.instanceContexts(blob.instanceId), id)
+        pipe.zrem(sessionKeys.orgIndex(blob.orgId), id)
+      }
+    }
+
+    try {
+      await pipe.exec()
+      this.logger.debug(`hardDeleteExpired: removed ${ids.length} contexts`)
+    } catch (err) {
+      this.logger.error(`hardDeleteExpired pipeline failed: ${err.message}`)
     }
   }
 

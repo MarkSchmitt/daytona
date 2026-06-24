@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: AGPL-3.0
  */
 
-import { FindOperator } from 'typeorm'
 import { SessionPoolService } from './session-pool.service'
 import { SessionInstance } from '../entities/session-instance.entity'
 import { SessionInstanceState } from '../enums/session-instance-state.enum'
@@ -37,14 +36,20 @@ function makeConfig(overrides: Record<string, number> = {}): TypedConfigService 
 
 /**
  * Build a SessionPoolService with just the dependencies scale-in / prune touch mocked.
- * `readyInstances` is what instanceRepo.find({where:{state:READY}}) returns; `loads` maps
+ * `seedInstances` is the full set the SessionInstanceStore holds; `findByState` filters it by
+ * state so scale-in (READY) and prune (ERROR) each see the right slice. `loads` maps
  * instanceId -> effective load.
  */
-function makePool(readyInstances: SessionInstance[], loads: Record<string, number> = {}) {
-  const instanceRepo = {
-    find: jest.fn(async () => readyInstances),
+function makePool(seedInstances: SessionInstance[], loads: Record<string, number> = {}) {
+  const instances = {
+    findByState: jest.fn(async (state: SessionInstanceState) => seedInstances.filter((i) => i.state === state)),
+    findById: jest.fn(async (id: string) => seedInstances.find((i) => i.id === id) ?? null),
     save: jest.fn(async (x: SessionInstance) => x),
-    delete: jest.fn(async () => ({ affected: 0 })),
+    update: jest.fn(async () => undefined),
+    delete: jest.fn(async () => undefined),
+    create: jest.fn(async (x: any) => x),
+    findByOrgTemplateState: jest.fn(async () => []),
+    countByState: jest.fn(async () => 0),
   }
   const sandboxService = { destroy: jest.fn(async () => undefined) }
   const sessions = { markInstanceSessionsInvalid: jest.fn(async () => undefined) }
@@ -55,7 +60,7 @@ function makePool(readyInstances: SessionInstance[], loads: Record<string, numbe
   }
 
   const pool = new SessionPoolService(
-    instanceRepo as any,
+    instances as any,
     {} as any, // templateRepo
     sandboxRepo as any,
     sandboxService as any,
@@ -65,7 +70,7 @@ function makePool(readyInstances: SessionInstance[], loads: Record<string, numbe
     load as any,
     {} as any, // scheduler
   )
-  return { pool, instanceRepo, sandboxService, sessions, load, sandboxRepo }
+  return { pool, instances, sandboxService, sessions, load, sandboxRepo }
 }
 
 function withConfig(pool: SessionPoolService, cfg: TypedConfigService): void {
@@ -84,7 +89,7 @@ describe('SessionPoolService scale-in', () => {
       const idleBusy = instance({ id: 'o2', lastActiveAt: old() }) // idle but has load -> keep
       const activeFree = instance({ id: 'o3', lastActiveAt: recent() }) // load 0 but not idle -> keep
 
-      const { pool, sandboxService, sessions, instanceRepo } = makePool([warm, idleFree, idleBusy, activeFree], {
+      const { pool, sandboxService, sessions, instances } = makePool([warm, idleFree, idleBusy, activeFree], {
         o1: 0,
         o2: 3,
         o3: 0,
@@ -96,7 +101,7 @@ describe('SessionPoolService scale-in', () => {
       expect(sandboxService.destroy).toHaveBeenCalledWith('sbx-o1', ORG)
       expect(sessions.markInstanceSessionsInvalid).toHaveBeenCalledWith('o1')
       // The reaped instance row was marked ERROR before destroy.
-      const saved = (instanceRepo.save as jest.Mock).mock.calls.map((c) => c[0] as SessionInstance)
+      const saved = (instances.save as jest.Mock).mock.calls.map((c) => c[0] as SessionInstance)
       expect(saved).toHaveLength(1)
       expect(saved[0].id).toBe('o1')
       expect(saved[0].state).toBe(SessionInstanceState.ERROR)
@@ -153,17 +158,24 @@ describe('SessionPoolService scale-in', () => {
   })
 
   describe('pruneErroredInstances', () => {
-    it('deletes ERROR rows older than the grace cutoff', async () => {
-      const { pool, instanceRepo } = makePool([])
+    it('deletes only ERROR rows older than the grace cutoff', async () => {
+      // grace = scaleInIdleSeconds (600s). 'stale' aged out; 'fresh' is within grace.
+      const stale = instance({
+        id: 'stale',
+        state: SessionInstanceState.ERROR,
+        updatedAt: new Date(Date.now() - 700_000),
+      })
+      const fresh = instance({
+        id: 'fresh',
+        state: SessionInstanceState.ERROR,
+        updatedAt: new Date(Date.now() - 10_000),
+      })
+      const { pool, instances } = makePool([stale, fresh])
+
       await (pool as any).pruneErroredInstances()
 
-      expect(instanceRepo.delete).toHaveBeenCalledTimes(1)
-      const arg = (instanceRepo.delete as jest.Mock).mock.calls[0][0] as {
-        state: SessionInstanceState
-        updatedAt: FindOperator<Date>
-      }
-      expect(arg.state).toBe(SessionInstanceState.ERROR)
-      expect(arg.updatedAt).toBeInstanceOf(FindOperator) // LessThan(cutoff)
+      expect(instances.delete).toHaveBeenCalledTimes(1)
+      expect(instances.delete).toHaveBeenCalledWith('stale')
     })
   })
 })

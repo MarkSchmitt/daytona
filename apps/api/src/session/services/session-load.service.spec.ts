@@ -80,7 +80,7 @@ function makeConfig(overrides: Record<string, number> = {}): TypedConfigService 
 function newService(config = makeConfig()): { svc: SessionLoadService; redis: FakeRedis } {
   const redis = new FakeRedis()
   const svc = new SessionLoadService(
-    {} as any, // instanceRepo (only used by the poller, not exercised here)
+    {} as any, // SessionInstanceStore (only used by the poller, not exercised here)
     redis as any,
     {} as any, // runnerService (poller only)
     config,

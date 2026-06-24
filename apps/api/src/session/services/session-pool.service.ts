@@ -7,7 +7,7 @@ import { randomUUID } from 'crypto'
 import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { Cron, CronExpression } from '@nestjs/schedule'
 import { InjectRepository } from '@nestjs/typeorm'
-import { LessThan, Repository } from 'typeorm'
+import { JsonContains, Repository } from 'typeorm'
 import { SessionInstance } from '../entities/session-instance.entity'
 import { SessionTemplate } from '../entities/session-template.entity'
 import { SessionInstanceState } from '../enums/session-instance-state.enum'
@@ -17,6 +17,7 @@ import { Organization } from '../../organization/entities/organization.entity'
 import { LockCode, RedisLockProvider } from '../../sandbox/common/redis-lock.provider'
 import { TypedConfigService } from '../../config/typed-config.service'
 import { SessionRepository } from './session-repository.service'
+import { SessionInstanceStore } from './session-instance-store.service'
 import { SessionLoadService } from './session-load.service'
 import { SessionScheduler } from './session-scheduler.service'
 import { SandboxState } from '../../sandbox/enums/sandbox-state.enum'
@@ -24,6 +25,11 @@ import { SandboxDesiredState } from '../../sandbox/enums/sandbox-desired-state.e
 import { Sandbox } from '../../sandbox/entities/sandbox.entity'
 
 const POOL_LOCK_TTL_SEC = 120
+
+// Labels stamped on every warm-pool sandbox at create time. The orphan reconciler keys off these
+// to find session sandboxes whose backing instance has disappeared (e.g. after a Redis wipe).
+const SESSION_SANDBOX_LABEL = 'daytona.io/session'
+const SESSION_INSTANCE_LABEL = 'daytona.io/session-instance'
 
 /**
  * SessionPoolService owns the warm-sandbox fleet per (organizationId, templateId).
@@ -44,8 +50,7 @@ export class SessionPoolService {
   private readonly logger = new Logger(SessionPoolService.name)
 
   constructor(
-    @InjectRepository(SessionInstance)
-    private readonly instanceRepo: Repository<SessionInstance>,
+    private readonly instances: SessionInstanceStore,
     @InjectRepository(SessionTemplate)
     private readonly templateRepo: Repository<SessionTemplate>,
     @InjectRepository(Sandbox)
@@ -114,9 +119,7 @@ export class SessionPoolService {
    * READY instances for (org, template), with dead/drifted ones rolled out before returning.
    */
   private async listLiveReadyInstances(orgId: string, template: SessionTemplate): Promise<SessionInstance[]> {
-    const ready = await this.instanceRepo.find({
-      where: { organizationId: orgId, templateId: template.id, state: SessionInstanceState.READY },
-    })
+    const ready = await this.instances.findByOrgTemplateState(orgId, template.id, SessionInstanceState.READY)
     const live: SessionInstance[] = []
     for (const inst of ready) {
       if (inst.snapshotId !== template.snapshotId) {
@@ -133,7 +136,7 @@ export class SessionPoolService {
   }
 
   private async countByState(orgId: string, templateId: string, state: SessionInstanceState): Promise<number> {
-    return this.instanceRepo.count({ where: { organizationId: orgId, templateId, state } })
+    return this.instances.countByState(orgId, templateId, state)
   }
 
   /**
@@ -157,15 +160,14 @@ export class SessionPoolService {
         (await this.countByState(orgId, templateId, SessionInstanceState.PROVISIONING))
       if (active >= max) return null
       const role = active < minWarm ? SessionInstanceRole.WARM : SessionInstanceRole.OVERFLOW
-      const row = this.instanceRepo.create({
+      // Persist before releasing the lock so the PROVISIONING row is counted by the next holder.
+      // snapshotId is set in provisionReserved (needs the template) — unset until then.
+      return await this.instances.create({
         organizationId: orgId,
         templateId,
-        // snapshotId is set in provisionReserved (needs the template) — placeholder until then.
         state: SessionInstanceState.PROVISIONING,
         role,
       })
-      // Persist before releasing the lock so the PROVISIONING row is counted by the next holder.
-      return await this.instanceRepo.save(row)
     } finally {
       await this.lockProvider.unlock(lockKey, lockCode).catch(() => undefined)
     }
@@ -183,7 +185,7 @@ export class SessionPoolService {
   ): Promise<SessionInstance> {
     reserved.snapshotId = template.snapshotId
     reserved.state = SessionInstanceState.PROVISIONING
-    let saved = await this.instanceRepo.save(reserved)
+    let saved = await this.instances.save(reserved)
     try {
       const idleTtlSec = this.config.get('session.context.idleTtlSeconds') ?? 3600
       const sandbox = await this.sandboxService.createFromSnapshot(
@@ -201,20 +203,20 @@ export class SessionPoolService {
         organization,
       )
       saved.sandboxId = sandbox.id
-      saved = await this.instanceRepo.save(saved)
+      saved = await this.instances.save(saved)
       return await this.waitForReady(saved.id)
     } catch (err) {
       this.logger.error(`pool provision failed for instance ${saved.id}: ${err.message}`)
       saved.state = SessionInstanceState.ERROR
       saved.errorReason = err.message
-      await this.instanceRepo.save(saved)
+      await this.instances.save(saved)
       throw err
     }
   }
 
   private async markActive(inst: SessionInstance): Promise<void> {
     try {
-      await this.instanceRepo.update({ id: inst.id }, { lastActiveAt: new Date() })
+      await this.instances.update(inst.id, { lastActiveAt: new Date() })
     } catch (err) {
       this.logger.debug(`markActive(${inst.id}) failed: ${err.message}`)
     }
@@ -226,9 +228,7 @@ export class SessionPoolService {
    */
   @Cron(CronExpression.EVERY_30_SECONDS, { name: 'session-pool-reconcile' })
   async reconcile(): Promise<void> {
-    const instances = await this.instanceRepo.find({
-      where: { state: SessionInstanceState.READY },
-    })
+    const instances = await this.instances.findByState(SessionInstanceState.READY)
     for (const inst of instances) {
       try {
         await this.reconcileOne(inst)
@@ -251,6 +251,52 @@ export class SessionPoolService {
       await this.pruneErroredInstances()
     } catch (err) {
       this.logger.warn(`pruneErroredInstances failed: ${err.message}`)
+    }
+  }
+
+  /**
+   * Orphan-sandbox reconciler — guards against Redis being wiped (instances treated as ephemeral).
+   * Finds every live sandbox labelled as a session sandbox and destroys any whose backing
+   * SessionInstance no longer exists in Redis, so a data loss can't leak running sandboxes.
+   *
+   * A creation-age grace window skips sandboxes young enough to still be mid-provision (their
+   * instance row is written before the sandbox, so this is belt-and-braces) to avoid racing an
+   * in-flight acquire.
+   */
+  @Cron(CronExpression.EVERY_5_MINUTES, { name: 'session-pool-orphan-reconcile' })
+  async reconcileOrphanSandboxes(): Promise<void> {
+    const graceMs = this.config.get('session.provisionTimeoutMs') ?? 180000
+    const cutoff = Date.now() - graceMs
+
+    let sandboxes: Sandbox[]
+    try {
+      sandboxes = await this.sandboxRepo.find({
+        where: { labels: JsonContains({ [SESSION_SANDBOX_LABEL]: 'true' }) },
+      })
+    } catch (err) {
+      this.logger.warn(`reconcileOrphanSandboxes: sandbox query failed: ${err.message}`)
+      return
+    }
+
+    for (const sandbox of sandboxes) {
+      try {
+        if (sandbox.state === SandboxState.DESTROYED || sandbox.desiredState === SandboxDesiredState.DESTROYED) {
+          continue
+        }
+        if (sandbox.createdAt && sandbox.createdAt.getTime() > cutoff) {
+          continue // too young — may still be provisioning
+        }
+        const instanceId = sandbox.labels?.[SESSION_INSTANCE_LABEL]
+        if (instanceId && (await this.instances.findById(instanceId))) {
+          continue // instance still tracked — not an orphan
+        }
+        this.logger.warn(
+          `destroying orphaned session sandbox ${sandbox.id} (instance ${instanceId ?? 'unknown'} not in Redis)`,
+        )
+        await this.sandboxService.destroy(sandbox.id, sandbox.organizationId)
+      } catch (err) {
+        this.logger.warn(`reconcileOrphanSandboxes: handling sandbox ${sandbox.id} failed: ${err.message}`)
+      }
     }
   }
 
@@ -279,7 +325,7 @@ export class SessionPoolService {
     const minWarm = this.config.get('session.scale.minWarm') ?? 1
     if (minWarm <= 1) return // default: lazy create already keeps exactly one warm
 
-    const ready = await this.instanceRepo.find({ where: { state: SessionInstanceState.READY } })
+    const ready = await this.instances.findByState(SessionInstanceState.READY)
     const groups = this.groupByOrgTemplate(ready)
     for (const [, members] of groups) {
       const { organizationId, templateId } = members[0]
@@ -309,7 +355,7 @@ export class SessionPoolService {
     const idleMs = (this.config.get('session.scale.scaleInIdleSeconds') ?? 600) * 1000
     const now = Date.now()
 
-    const ready = await this.instanceRepo.find({ where: { state: SessionInstanceState.READY } })
+    const ready = await this.instances.findByState(SessionInstanceState.READY)
     const groups = this.groupByOrgTemplate(ready)
     for (const [, members] of groups) {
       let total = members.length
@@ -338,8 +384,13 @@ export class SessionPoolService {
   /** Delete ERROR instance rows (and their already-invalid sessions) after a grace period. */
   private async pruneErroredInstances(): Promise<void> {
     const graceMs = (this.config.get('session.scale.scaleInIdleSeconds') ?? 600) * 1000
-    const cutoff = new Date(Date.now() - graceMs)
-    await this.instanceRepo.delete({ state: SessionInstanceState.ERROR, updatedAt: LessThan(cutoff) })
+    const cutoff = Date.now() - graceMs
+    const errored = await this.instances.findByState(SessionInstanceState.ERROR)
+    for (const inst of errored) {
+      if (inst.updatedAt && inst.updatedAt.getTime() < cutoff) {
+        await this.instances.delete(inst.id)
+      }
+    }
   }
 
   private groupByOrgTemplate(instances: SessionInstance[]): Map<string, SessionInstance[]> {
@@ -367,7 +418,7 @@ export class SessionPoolService {
     this.logger.log(`rolling SessionInstance ${inst.id}: ${reason}`)
     inst.state = SessionInstanceState.ERROR
     inst.errorReason = reason
-    await this.instanceRepo.save(inst)
+    await this.instances.save(inst)
     await this.sessions.markInstanceSessionsInvalid(inst.id)
     // Destroy the underlying sandbox so a rolled instance can't orphan it (pruneErroredInstances
     // only deletes the DB row). Guard on the sandbox row still existing and not already being
@@ -396,7 +447,7 @@ export class SessionPoolService {
   private async waitForReady(instanceId: string): Promise<SessionInstance> {
     const deadline = Date.now() + (this.config.get('session.provisionTimeoutMs') ?? 180000)
     while (Date.now() < deadline) {
-      const inst = await this.instanceRepo.findOne({ where: { id: instanceId } })
+      const inst = await this.instances.findById(instanceId)
       if (!inst) throw new NotFoundException(`SessionInstance ${instanceId} disappeared while waiting`)
       if (inst.state === SessionInstanceState.ERROR) {
         throw new Error(`SessionInstance failed: ${inst.errorReason ?? 'unknown'}`)
@@ -409,7 +460,7 @@ export class SessionPoolService {
           // Mark READY on sandbox STARTED; the first real exec surfaces a clean failure if the
           // daemon isn't reachable (same semantic as SessionInvalidatedError).
           inst.state = SessionInstanceState.READY
-          await this.instanceRepo.save(inst)
+          await this.instances.save(inst)
           return inst
         }
       }

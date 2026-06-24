@@ -4,12 +4,11 @@
  */
 
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common'
-import { InjectRepository } from '@nestjs/typeorm'
-import { Repository } from 'typeorm'
 import { InjectRedis } from '@nestjs-modules/ioredis'
 import Redis from 'ioredis'
 import { SessionInstance } from '../entities/session-instance.entity'
 import { SessionInstanceState } from '../enums/session-instance-state.enum'
+import { SessionInstanceStore } from './session-instance-store.service'
 import { RunnerService } from '../../sandbox/services/runner.service'
 import { TypedConfigService } from '../../config/typed-config.service'
 import { buildDaemonAccess } from '../common/daemon-access'
@@ -52,8 +51,7 @@ export class SessionLoadService implements OnModuleInit, OnModuleDestroy {
   private pollTimer?: ReturnType<typeof setInterval>
 
   constructor(
-    @InjectRepository(SessionInstance)
-    private readonly instanceRepo: Repository<SessionInstance>,
+    private readonly instances: SessionInstanceStore,
     @InjectRedis()
     private readonly redis: Redis,
     private readonly runnerService: RunnerService,
@@ -197,7 +195,7 @@ export class SessionLoadService implements OnModuleInit, OnModuleDestroy {
   // -- polling -------------------------------------------------------------
 
   private async pollAll(): Promise<void> {
-    const instances = await this.instanceRepo.find({ where: { state: SessionInstanceState.READY } })
+    const instances = await this.instances.findByState(SessionInstanceState.READY)
     if (instances.length === 0) return
     await Promise.all(instances.map((inst) => this.pollOne(inst).catch(() => undefined)))
   }

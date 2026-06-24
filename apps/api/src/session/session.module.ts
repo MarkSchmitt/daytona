@@ -6,10 +6,9 @@
 import { Module } from '@nestjs/common'
 import { TypeOrmModule } from '@nestjs/typeorm'
 import { SessionTemplate } from './entities/session-template.entity'
-import { SessionInstance } from './entities/session-instance.entity'
-import { Session } from './entities/session.entity'
 import { SessionTemplateService } from './services/session-template.service'
 import { SessionRepository } from './services/session-repository.service'
+import { SessionInstanceStore } from './services/session-instance-store.service'
 import { SessionGcService } from './services/session-gc.service'
 import { SessionPoolService } from './services/session-pool.service'
 import { SessionLoadService } from './services/session-load.service'
@@ -26,17 +25,17 @@ import { Sandbox } from '../sandbox/entities/sandbox.entity'
  *  - OrganizationModule supplies OrganizationAuthContextGuard.
  *  - The Sandbox entity is registered here via TypeOrmModule.forFeature so the pool service
  *    can read sandbox state for reconcile (without owning the sandbox repository).
+ *
+ * Session and SessionInstance live entirely in Redis (SessionRepository / SessionInstanceStore);
+ * only SessionTemplate remains a Postgres entity.
  */
 @Module({
-  imports: [
-    SandboxModule,
-    OrganizationModule,
-    TypeOrmModule.forFeature([SessionTemplate, SessionInstance, Session, Sandbox]),
-  ],
+  imports: [SandboxModule, OrganizationModule, TypeOrmModule.forFeature([SessionTemplate, Sandbox])],
   controllers: [SessionController],
   providers: [
     SessionTemplateService,
     SessionRepository,
+    SessionInstanceStore,
     SessionGcService,
     SessionLoadService,
     SessionScheduler,
